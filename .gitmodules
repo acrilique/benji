@@ -2,3 +2,7 @@
 	path = vendor/miniaudio
 	url = https://github.com/mackron/miniaudio.git
 	ignore = dirty
+[submodule "vendor/concord"]
+	path = vendor/concord
+	url = https://github.com/Cogmasters/concord.git
+	ignore = dirty
