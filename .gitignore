@@ -1,0 +1,6 @@
+.build
+*.a
+bot-key
+main
+output
+testfile.flac
