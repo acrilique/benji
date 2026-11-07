@@ -38,13 +38,10 @@ opus_decoder_destroy :: (st: *void) -> void #foreign opus;
 opus_decode :: (st: *void, data: *u8, len: s32, pcm: *s16, frame_size: s32, decode_fec: s32) -> s32 #foreign opus;
 opus_strerror :: (error: s32) -> *u8 #foreign opus;
 
-discord_init :: (token: *u8) -> *void #foreign discord;
-discord_add_intents :: (client: *void, code: u64) -> void #foreign discord;
-discord_on_ready_cb :: #type(client: *void, discord_ready: *void) -> void #c_call;
-discord_set_on_ready :: (client: *void, cb: discord_on_ready_cb) -> void #foreign discord;
-discord_run :: (client: *void) -> s32 #foreign discord;
-discord_shutdown :: (client: *void) -> void #foreign discord;
-discord_cleanup :: (client: *void) -> void #foreign discord;
+bot_user_id: u64;
+
+#load "concord.jai";
+#load "commands.jai";
 
 TESTFILE :: "testfile.flac";
 TOKENFILE :: "bot-key";
@@ -55,18 +52,7 @@ Args :: struct {
 	music_folder: string;
 }
 
-on_ready :: (client: *void, discord_ready: *void) #c_call {
-	new_context: Context;
-
-	push_context new_context {
-		print("Discord is ready\n");
-	}
-}
-
-main :: () {
-	success, args, is_set := parse_arguments(Args);
-	if !success return;
-
+decode_and_opus_encode :: () {
 	buffer: [2 * FRAME_SIZE]s16;
 	encoded_buf: [4000]u8;
 	opus_err: s32;
@@ -74,7 +60,6 @@ main :: () {
 	outfile, s := file_open("output", 
 		for_writing = true,
 		keep_existing_content = false);
-
 	if !s {
 		print("Failed to open file for writing.\n");
 		return;
@@ -137,6 +122,12 @@ main :: () {
 
 		if frames_read < FRAME_SIZE break;
 	}
+}
+
+main :: () {
+	success, args, is_set := parse_arguments(Args);
+	if !success return;
+
 
 	token, result := read_entire_file(TOKENFILE);
 	if !result {
@@ -146,12 +137,19 @@ main :: () {
 
 	print("Music folder: %\n", args.music_folder);
 	client := discord_init(to_c_string(token));
+	if !client {
+		print("Failed to initialize discord client\n");
+		return;
+	}
+	defer discord_cleanup(client);
 
 	discord_set_on_ready(client, on_ready);
-	discord_add_intents(client, 1 << 0 | 1 << 7);
+	discord_set_on_interaction_create(client, on_interaction_create);
+	discord_add_intents(client, DISCORD_INTENT_GUILDS | DISCORD_INTENT_GUILD_VOICE_STATES);
+	discord_set_on_voice_state_update(client, on_voice_state_update);
+	discord_set_on_voice_server_update(client, on_voice_server_update);
 	
-	discord_run(client);
-
-	discord_cleanup(client);
+	err := discord_run(client);
+	print("Discord connection stopped: %\n", to_string(discord_strerror(err, client)));
 }
 
