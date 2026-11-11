@@ -28,22 +28,19 @@ bot_user_id: u64;
 voice_ws_running: bool;
 
 Voice_Ws :: struct {
-    // Written by the main thread before thread_start, read-only afterwards.
-    endpoint, session_id, token: string;   // owned copies, not pointers into `voice`
+    endpoint, session_id, token: string;
     guild_id: u64;
 
-    // Shared: main thread writes it, the ws thread reads it. Use atomic_read/atomic_write (Atomics).
     stop_requested: bool;
 
-    // Only the ws thread touches these.
     curl: *CURL;
     socket: curl_socket_t;
-    rx: [65536]u8;  rx_len: s64;          // the incoming message being assembled
-    heartbeat_interval_ms: float64;        // 0 until Hello arrives
+    rx: [65536]u8;  rx_len: s64;
+    heartbeat_interval_ms: float64;
     next_heartbeat: Apollo_Time;
-    last_seq: s64 = -1;                    // -1 = "no numbered message yet", which the docs allow
+    last_seq: s64 = -1;
     last_nonce: s64;  waiting_for_ack: bool;
-    // Ready's results, the inputs to step 6:
+
     ssrc: u32;  ip: string;  port: u16;
 }
 
