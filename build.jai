@@ -5,6 +5,16 @@
     #import "Compiler";
     #import "Process";
 
+    for patch: string.["../patches/concord-null-channel.patch"] {
+        applied := run_command("git", "apply", "--reverse", "--check", patch, working_directory = "vendor/concord", capture_and_return_output = true);
+        if applied.exit_code == 0  continue;
+
+        apply := run_command("git", "apply", patch, working_directory = "vendor/concord");
+        if apply.exit_code != 0 {
+            compiler_report(tprint("Failed to apply % to concord.", patch));
+        }
+    }
+
     result := run_command("make", "-j", working_directory = "vendor/concord");
     if result.exit_code != 0 {
         compiler_report("\"make\" failed while building concord.");
