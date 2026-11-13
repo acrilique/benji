@@ -3,6 +3,7 @@
 #import "Command_Line";
 #import "File";
 #import "POSIX";
+#import "Socket";
 #import "String";
 #import "Thread";
 
@@ -19,6 +20,10 @@ TESTFILE :: "testfile.flac";
 TOKENFILE :: "bot-key";
 OPUS_APPLICATION_AUDIO :: 2049;
 FRAME_SIZE :: 960;
+
+VOICE_MODE :: "aead_xchacha20_poly1305_rtpsize";
+IP_DISCOVERY_ATTEMPTS   :: 3;
+IP_DISCOVERY_TIMEOUT_MS :: 1000;
 
 Args :: struct {
     music_folder: string;
@@ -86,6 +91,15 @@ Voice_Ws :: struct {
     last_nonce: s64;  waiting_for_ack: bool;
 
     ssrc: u32;  ip: string;  port: u16;
+
+    udp: Socket = INVALID_SOCKET;
+    external_ip: string;  external_port: u16;
+
+    have_session_description: bool;
+    secret_key: [32]u8;
+    dave_protocol_version: s32;
+
+    users_in_call: [..]u64;
 }
 
 voice_ws: Voice_Ws;
@@ -341,6 +355,8 @@ stop_voice_ws :: () {
     free(voice_ws.session_id);
     free(voice_ws.token);
     free(voice_ws.ip);
+    free(voice_ws.external_ip);
+    array_free(voice_ws.users_in_call);
     voice_ws = .{};
     voice_ws_running = false;
 }
@@ -358,6 +374,7 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
     ws := cast(*Voice_Ws) thread.data;
     if !ws_connect(ws) return 1;
     defer curl_easy_cleanup(ws.curl);
+    defer close_and_reset(*ws.udp);
 
     gotta_stop: bool;
 
@@ -437,8 +454,7 @@ ws_drain :: (ws: *Voice_Ws) -> bool {
                     return false;
                 }
                 if meta.flags & CURLWS_TEXT {
-                    print("<- %\n", msg);
-                    handle_text(ws, msg);
+                    if !handle_text(ws, msg)  return false;
                 }
                 if meta.flags & CURLWS_BINARY {
                     if msg.count < 3 {
@@ -458,29 +474,29 @@ ws_drain :: (ws: *Voice_Ws) -> bool {
     return false;
 }
 
-handle_text :: (ws: *Voice_Ws, msg: string) {
+handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
     parser: Jsmn_Parser;
     tokens: [128]Jsmn_Token;
     jsmn_init(*parser);
-    num_tokens := jsmn_parse(*parser, msg.data, xx msg.count, tokens.data, tokens.count); 
+    num_tokens := jsmn_parse(*parser, msg.data, xx msg.count, tokens.data, tokens.count);
     if num_tokens < 0 {
-        print("Bad JSON (%)\n", num_tokens);
-        return;
+        print("<- %\nBad JSON (%)\n", msg, num_tokens);
+        return true;
     }
 
     loader: Jsmnf_Loader;
     pairs: [128]Jsmnf_Pair;
     jsmnf_init(*loader);
     if jsmnf_load(*loader, msg.data, tokens.data, xx num_tokens, pairs.data, pairs.count) < 0 {
-        print("Couldn't load JSON\n");
-        return;
+        print("<- %\nCouldn't load JSON\n", msg);
+        return true;
     }
 
     root := *pairs[0];
     op_pair := json_find(root, msg, "op");
     if !op_pair {
-        print("Message without \"op\"\n");
-        return;
+        print("<- %\nMessage without \"op\"\n", msg);
+        return true;
     }
     op := string_to_int(json_text(op_pair, msg));
 
@@ -489,12 +505,16 @@ handle_text :: (ws: *Voice_Ws, msg: string) {
 
     d := json_find(root, msg, "d");
 
+    // These get a one-line summary. Op 4 holds the secret key, so it must not be logged as is.
+    quiet := op == 4 || op == 6 || op == 11 || op == 13 || op == 18 || op == 20;
+    if !quiet  print("<- %\n", msg);
+
     if op == {
         case 8; // Hello
             interval := json_find(d, msg, "heartbeat_interval");
             if !interval {
                 print("Message without \"heartbeat_interval\"\n");
-                return;
+                return true;
             }
 
             ws.heartbeat_interval_ms = string_to_float64(json_text(interval, msg));
@@ -507,7 +527,7 @@ handle_text :: (ws: *Voice_Ws, msg: string) {
                 rtt := to_milliseconds(current_time_monotonic()) - ws.last_nonce;
                 print("Heartbeat ACK (% ms)\n", rtt);
                 ws.waiting_for_ack = false;
-            } else print("Unexpected nonce in ACK\n");
+            } else print("Unexpected nonce in ACK: %\n", msg);
         case 2; // Ready
             ssrc  := json_find(d, msg, "ssrc");
             ip    := json_find(d, msg, "ip");
@@ -515,24 +535,68 @@ handle_text :: (ws: *Voice_Ws, msg: string) {
             modes := json_find(d, msg, "modes");
             if !ssrc || !ip || !port || !modes {
                 print("Ready is missing fields\n");
-                return; 
+                return false;
             }
 
-            free(ws.ip);        
+            free(ws.ip);
 
             ws.ssrc = xx string_to_int(json_text(ssrc, msg));
             ws.ip   = copy_string(json_text(ip, msg));
             ws.port = xx string_to_int(json_text(port, msg));
-        
+
             has_xchacha := false;
             for 0..modes.size-1 {
                 mode := json_text(*modes.fields[it], msg);
-                if mode == "aead_xchacha20_poly1305_rtpsize"  has_xchacha = true;
+                if mode == VOICE_MODE  has_xchacha = true;
             }
             print("Ready: ssrc=% udp=%:% xchacha=%\n", ws.ssrc, ws.ip, ws.port, has_xchacha);
+            if !has_xchacha {
+                print("The voice server doesn't offer %\n", VOICE_MODE);
+                return false;
+            }
+
+            if !udp_open(ws)         return false;
+            if !udp_discover_ip(ws)  return false;
+            if !ws_send_select_protocol(ws)  return false;
+        case 4; // Session Description
+            mode := json_find(d, msg, "mode");
+            key  := json_find(d, msg, "secret_key");
+            dave := json_find(d, msg, "dave_protocol_version");
+            if !mode || !key || key.size != ws.secret_key.count {
+                print("Session Description is missing fields or has a bad secret_key\n");
+                return false;
+            }
+
+            if json_text(mode, msg) != VOICE_MODE {
+                print("Session Description picked mode %, we asked for %\n", json_text(mode, msg), VOICE_MODE);
+                return false;
+            }
+
+            for 0..key.size-1  ws.secret_key[it] = xx string_to_int(json_text(*key.fields[it], msg));
+            ws.dave_protocol_version = ifx dave then cast(s32) string_to_int(json_text(dave, msg)) else 0;
+            ws.have_session_description = true;
+            print("<- Session Description: mode=% dave_protocol_version=% secret_key=(% bytes)\n",
+                json_text(mode, msg), ws.dave_protocol_version, ws.secret_key.count);
+        case 11; // Clients Connect
+            ids := json_find(d, msg, "user_ids");
+            if !ids  return true;
+            for 0..ids.size-1 {
+                id, ok := string_to_int(json_text(*ids.fields[it], msg), 10, u64);
+                if ok  array_add_if_unique(*ws.users_in_call, id);
+            }
+            print("<- Clients Connect: % user(s), % in the call\n", ids.size, ws.users_in_call.count);
+        case 13; // Client Disconnect
+            user := json_find(d, msg, "user_id");
+            if !user  return true;
+            id, ok := string_to_int(json_text(user, msg), 10, u64);
+            if ok  array_unordered_remove_by_value(*ws.users_in_call, id);
+            print("<- Client Disconnect: %, % in the call\n", id, ws.users_in_call.count);
+        case 18; // Client Flags
+        case 20; // Client Platform
         case;
             print("Unhandled \"op\" (%)\n", op);
     }
+    return true;
 }
 
 ws_send_text :: (ws: *Voice_Ws, text: string) -> bool {
@@ -565,6 +629,28 @@ ws_send_identify :: (ws: *Voice_Ws) {
     ws_send_text(ws, jw_result(*w));
 }
 
+ws_send_select_protocol :: (ws: *Voice_Ws) -> bool {
+    w: Json_Writer;
+    jw_init(*w);
+    jw_object(*w);
+        jw_key(*w, "op"); jw_int(*w, 1);
+        jw_key(*w, "d");
+        jw_object(*w);
+            jw_key(*w, "protocol"); jw_string(*w, "udp");
+            jw_key(*w, "data");
+            jw_object(*w);
+                jw_key(*w, "address"); jw_string(*w, ws.external_ip);
+                jw_key(*w, "port");    jw_int(*w, ws.external_port);
+                jw_key(*w, "mode");    jw_string(*w, VOICE_MODE);
+            jw_pop(*w);
+        jw_pop(*w);
+    jw_pop(*w);
+
+    if w.failed { print("Couldn't build Select Protocol\n"); return false; }
+    print("-> %\n", jw_result(*w));
+    return ws_send_text(ws, jw_result(*w));
+}
+
 ws_send_heartbeat :: (ws: *Voice_Ws) -> bool {
     if ws.waiting_for_ack  print("Voice WS: no ACK for the previous heartbeat\n");
 
@@ -588,6 +674,99 @@ ws_send_heartbeat :: (ws: *Voice_Ws) -> bool {
     now := current_time_monotonic();
     if ws.next_heartbeat < now  ws.next_heartbeat = now + interval;
     return true;
+}
+
+//
+// Voice UDP
+//
+
+udp_open :: (ws: *Voice_Ws) -> bool {
+    close_and_reset(*ws.udp);
+
+    ws.udp = socket(AF_INET, .SOCK_DGRAM, .IPPROTO_UDP);
+    if ws.udp == INVALID_SOCKET {
+        print("Couldn't create the UDP socket: %\n", errno());
+        return false;
+    }
+
+    address: sockaddr_in;
+    address.sin_family = AF_INET;
+    address.sin_port = htons(ws.port);
+    ip := to_c_string(ws.ip);
+    defer free(ip);
+    if inet_pton(AF_INET, ip, *address.sin_addr) != 1 {
+        print("Voice server IP isn't IPv4: %\n", ws.ip);
+        return false;
+    }
+
+    if connect(ws.udp, cast(*sockaddr) *address, size_of(sockaddr_in)) != 0 {
+        print("Couldn't connect the UDP socket to %:%: %\n", ws.ip, ws.port, errno());
+        return false;
+    }
+
+    timeout: timeval;
+    timeout.tv_sec  = IP_DISCOVERY_TIMEOUT_MS / 1000;
+    timeout.tv_usec = (IP_DISCOVERY_TIMEOUT_MS % 1000) * 1000;
+    if setsockopt(ws.udp, SOL_SOCKET, SO_RCVTIMEO, *timeout, size_of(timeval)) != 0 {
+        print("Couldn't set the UDP receive timeout: %\n", errno());
+        return false;
+    }
+
+    return true;
+}
+
+udp_discover_ip :: (ws: *Voice_Ws) -> bool {
+    request: [74]u8;
+    put_u16_be(request.data,     0x1);
+    put_u16_be(request.data + 2, 70);
+    put_u32_be(request.data + 4, ws.ssrc);
+
+    reply: [74]u8;
+
+    for attempt: 1..IP_DISCOVERY_ATTEMPTS {
+        sent := send(ws.udp, request.data, request.count, 0);
+        if sent != request.count {
+            print("IP discovery: send failed (%), attempt %/%\n", errno(), attempt, IP_DISCOVERY_ATTEMPTS);
+            continue;
+        }
+
+        got := recv(ws.udp, reply.data, reply.count, 0);
+        if got < 0 {
+            err := errno();
+            if err == EAGAIN || err == EWOULDBLOCK
+                print("IP discovery: no reply within % ms, attempt %/%\n", IP_DISCOVERY_TIMEOUT_MS, attempt, IP_DISCOVERY_ATTEMPTS);
+            else
+                print("IP discovery: recv failed (%), attempt %/%\n", err, attempt, IP_DISCOVERY_ATTEMPTS);
+            continue;
+        }
+
+        if got != reply.count || get_u16_be(reply.data) != 0x2 || get_u32_be(reply.data + 4) != ws.ssrc {
+            print("IP discovery: unexpected reply (% bytes, type %), attempt %/%\n", got, get_u16_be(reply.data), attempt, IP_DISCOVERY_ATTEMPTS);
+            continue;
+        }
+
+        address_field := reply.data + 8;
+        address_len := 0;
+        while address_len < 64 && address_field[address_len] != 0  address_len += 1;
+
+        free(ws.external_ip);
+        ws.external_ip   = copy_string(string.{address_len, address_field});
+        ws.external_port = get_u16_be(reply.data + 72);
+        print("IP discovery: we are %:%\n", ws.external_ip, ws.external_port);
+        return true;
+    }
+
+    print("IP discovery failed after % attempts\n", IP_DISCOVERY_ATTEMPTS);
+    return false;
+}
+
+put_u16_be :: (p: *u8, v: u16) { p[0] = xx (v >> 8); p[1] = xx (v & 0xFF); }
+put_u32_be :: (p: *u8, v: u32) {
+    p[0] = xx (v >> 24); p[1] = xx ((v >> 16) & 0xFF); p[2] = xx ((v >> 8) & 0xFF); p[3] = xx (v & 0xFF);
+}
+get_u16_be :: (p: *u8) -> u16 { return ((cast(u16) p[0]) << 8) | p[1]; }
+get_u32_be :: (p: *u8) -> u32 {
+    return ((cast(u32) p[0]) << 24) | ((cast(u32) p[1]) << 16) | ((cast(u32) p[2]) << 8) | p[3];
 }
 
 //
