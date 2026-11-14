@@ -40,10 +40,17 @@ DISCORD_CHANNEL_GUILD_VOICE       :: 2;
 DISCORD_CHANNEL_GUILD_STAGE_VOICE :: 13;
 
 DISCORD_APPLICATION_CHAT_INPUT     :: 1;
+DISCORD_APPLICATION_OPTION_STRING  :: 3;
 DISCORD_APPLICATION_OPTION_CHANNEL :: 7;
 
-DISCORD_INTERACTION_APPLICATION_COMMAND         :: 2;
-DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE :: 4;
+DISCORD_INTERACTION_APPLICATION_COMMAND              :: 2;
+DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE :: 4;
+
+DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE      :: 4;
+DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE_RESULT :: 8;
+
+DISCORD_MAX_AUTOCOMPLETE_CHOICES :: 25;
+DISCORD_MAX_CHOICE_LENGTH        :: 100;
 
 // Concord's list structs all share this shape.
 Discord_List :: struct (T: Type) {
@@ -94,13 +101,18 @@ Discord_Interaction :: struct {
     data: *Discord_Interaction_Data;
     guild_id: u64;
     channel_id: u64;
-    member: *void;
+    member: *Discord_Guild_Member;  // set for commands run in a server
     user: *void;
     token: *u8;
     version: s32;
     message: *void;
     locale: *u8;
     guild_locale: *u8;
+}
+
+Discord_Command_Option_Choice :: struct {
+    name: *u8;
+    value: *u8;
 }
 
 Discord_Command_Option :: struct {
@@ -138,7 +150,7 @@ Discord_Interaction_Callback_Data :: struct {
     embeds: *void;
     flags: u64;
     attachments: *void;
-    choices: *void;
+    choices: *Discord_List(Discord_Command_Option_Choice);
     custom_id: *u8;
     title: *u8;
 }
@@ -162,6 +174,42 @@ Discord_Ret :: struct {
     fail: #type (client: *void, response: *Discord_Response) #c_call;
     done: *void;
     sync: bool;
+}
+
+Discord_Guild_Member :: struct {
+    user: *Discord_User;
+}
+
+Discord_Guild :: struct {
+    id: u64;
+    name: *u8;
+    icon: *u8;
+    icon_hash: *u8;
+    splash: *u8;
+    discovery_splash: *u8;
+    owner: bool;
+    owner_id: u64;
+    permissions: u64;
+    afk_channel_id: u64;
+    afk_timeout: s32;
+    widget_enabled: bool;
+    widget_channel_id: u64;
+    verification_level: s32;
+    default_message_notifications: s32;
+    explicit_content_filter: s32;
+    roles: *void;
+    emojis: *void;
+    features: *void;
+    mfa_level: s32;
+    application_id: u64;
+    system_channel_id: u64;
+    system_channel_flags: u64;
+    rules_channel_id: u64;
+    joined_at: u64;
+    large: bool;
+    unavailable: bool;
+    member_count: s32;
+    voice_states: *Discord_List(Discord_Voice_State); // These lack `guild_id`.
 }
 
 Discord_Voice_State :: struct {
@@ -216,6 +264,7 @@ Discord_User :: struct {
 #assert size_of(Discord_Interaction_Option) == 40;
 #assert size_of(Discord_Interaction_Data) == 80;
 #assert size_of(Discord_Interaction) == 104;
+#assert size_of(Discord_Command_Option_Choice) == 16;
 #assert size_of(Discord_Command_Option) == 80;
 #assert size_of(Discord_Command) == 80;
 #assert size_of(Discord_Interaction_Callback_Data) == 72;
@@ -223,6 +272,7 @@ Discord_User :: struct {
 #assert size_of(Discord_Response) == 24;
 #assert size_of(Discord_Ret) == 56;
 #assert size_of(Discord_Voice_State) == 56;
+#assert size_of(Discord_Guild) == 200;
 #assert size_of(Discord_Update_Voice_State) == 24;
 #assert size_of(Discord_Voice_Server_Update) == 24;
 #assert size_of(Discord_User) == 104;
@@ -231,6 +281,7 @@ discord_init :: (token: *u8) -> *void #foreign discord;
 discord_add_intents :: (client: *void, code: u64) -> void #foreign discord;
 discord_set_on_ready :: (client: *void, callback: #type (client: *void, event: *Discord_Ready) #c_call) -> void #foreign discord;
 discord_set_on_interaction_create :: (client: *void, callback: #type (client: *void, event: *Discord_Interaction) #c_call) -> void #foreign discord;
+discord_set_on_guild_create :: (client: *void, callback: #type (client: *void, event: *Discord_Guild) #c_call) -> void #foreign discord;
 discord_run :: (client: *void) -> s32 #foreign discord;
 discord_shutdown :: (client: *void) -> void #foreign discord;
 discord_cleanup :: (client: *void) -> void #foreign discord;

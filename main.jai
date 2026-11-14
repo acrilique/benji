@@ -2,8 +2,10 @@
 #import "Basic";
 #import "Command_Line";
 #import "File";
+#import "File_Utilities";
 #import "POSIX";
 #import "Socket";
+#import "Sort";
 #import "String";
 #import "Thread";
 
@@ -16,7 +18,6 @@
 
 Context :: #Context;
 
-TESTFILE :: "testfile.flac";
 TOKENFILE :: "bot-key";
 OPUS_APPLICATION_AUDIO :: 2049;
 FRAME_SIZE :: 960;
@@ -38,6 +39,7 @@ NONCE_SUFFIX_SIZE   :: 4;
 SILENCE_FRAME       :: u8.[0xF8, 0xFF, 0xFE];
 SILENCE_FRAME_COUNT :: 5;
 MAX_LAG_MS          :: 200;
+PLAYER_IDLE_WAIT_MS :: 100;
 
 Args :: struct {
     music_folder: string;
@@ -53,7 +55,21 @@ main :: () {
         return;
     }
 
-    print("Music folder: %\n", args.music_folder);
+    if !args.music_folder {
+        print("Pass the folder to play from: -music_folder <path>\n");
+        return;
+    }
+    folder, folder_ok := get_absolute_path(args.music_folder);
+    if !folder_ok || !is_directory(folder) {
+        print("Music folder % isn't a folder\n", args.music_folder);
+        return;
+    }
+    music_folder = copy_string(folder);
+    print("Music folder: %\n", music_folder);
+
+    init(*player.mutex, "player");
+    init(*player.wake);
+
     daveSetLogSinkCallback(on_dave_log);
     client := discord_init(to_c_string(token));
     if !client {
@@ -65,6 +81,7 @@ main :: () {
     discord_add_intents(client, DISCORD_INTENT_GUILDS | DISCORD_INTENT_GUILD_VOICE_STATES);
     discord_set_on_ready(client, on_ready);
     discord_set_on_interaction_create(client, on_interaction_create);
+    discord_set_on_guild_create(client, on_guild_create);
     discord_set_on_voice_state_update(client, on_voice_state_update);
     discord_set_on_voice_server_update(client, on_voice_server_update);
 
@@ -77,6 +94,33 @@ main :: () {
 //
 
 bot_user_id: u64;
+music_folder: string;
+
+Member_Voice_State :: struct {
+    guild_id: u64;
+    user_id: u64;
+    channel_id: u64;
+}
+
+voice_states: [..]Member_Voice_State;
+
+Track :: struct {
+    path: string;
+    name: string;
+}
+
+AUDIO_EXTENSIONS :: string.["flac", "mp3", "wav"];
+
+Player :: struct {
+    mutex: Mutex;
+    wake: Semaphore;
+    pending: [..]Track;
+    playing: [..]Track;
+    current := -1;
+    stop_requested: bool;
+}
+
+player: Player;
 
 Voice_Connection :: struct {
     session_id: [64]u8;
@@ -98,6 +142,7 @@ Voice_Ws :: struct {
 
     stop_requested: bool;
 
+    curl_mutex: Mutex; // Never take dave_mutex while holding it
     curl: *CURL;
     socket: curl_socket_t;
     rx: [65536]u8;  rx_len: s64;
@@ -160,7 +205,12 @@ on_ready :: (client: *void, event: *Discord_Ready) #c_call {
 on_interaction_create :: (client: *void, event: *Discord_Interaction) #c_call {
     new_context: Context;
     push_context new_context {
-        if event.type != DISCORD_INTERACTION_APPLICATION_COMMAND || !event.data return;
+        if !event.data  return;
+        if event.type == DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE {
+            send_file_suggestions(client, event);
+            return;
+        }
+        if event.type != DISCORD_INTERACTION_APPLICATION_COMMAND  return;
 
         text := command_handle(client, event);
         defer free(text);
@@ -168,9 +218,24 @@ on_interaction_create :: (client: *void, event: *Discord_Interaction) #c_call {
     }
 }
 
+on_guild_create :: (client: *void, event: *Discord_Guild) #c_call {
+    new_context: Context;
+    push_context new_context {
+        for voice_states  if it.guild_id == event.id  remove it;
+
+        if !event.voice_states  return;
+        for 0..event.voice_states.size - 1 {
+            state := *event.voice_states.array[it];
+            remember_voice_state(event.id, state.user_id, state.channel_id);
+        }
+    }
+}
+
 on_voice_state_update :: (client: *void, event: *Discord_Voice_State) #c_call {
     new_context: Context;
     push_context new_context {
+        remember_voice_state(event.guild_id, event.user_id, event.channel_id);
+
         if event.user_id != bot_user_id ||
             event.guild_id != voice.guild_id return;
 
@@ -217,24 +282,32 @@ command_handle :: (client: *void, event: *Discord_Interaction) -> string {
 
     name := to_string(event.data.name);
 
+    if name == "play" {
+        file := string_option(event.data, "file");  // optional: without it, play from the top
+
+        caller := ifx event.member && event.member.user then event.member.user.id else 0;
+        channel_id := voice_channel_of(event.guild_id, caller);
+        if !channel_id  return copy_string("Join an audio channel first, or use /join to pick one.");
+
+        return join_and_play(client, event.guild_id, channel_id, file);
+    }
+
     if name == "join" {
         channel_id, found := channel_option(event.data, "channel");
         if !found return copy_string("Pick an audio channel.");
+        file := string_option(event.data, "file");
 
-        if voice.guild_id != 0 && voice.guild_id != event.guild_id
-            return copy_string("Already connected in another server, doing nothing.");
+        return join_and_play(client, event.guild_id, channel_id, file);
+    }
 
-        if do_we_have_credentials() && channel_id == voice.channel_id
-            return copy_string("Already here.");
+    if name == "stop" {
+        if event.guild_id != voice.guild_id
+            return copy_string("Not connected to any channel in this server.");
 
-        stop_voice_ws();
-
-        voice.guild_id = event.guild_id;
-        voice.state_update_received = false;
-        voice.server_update_received = false;
-        update := Discord_Update_Voice_State.{ guild_id = event.guild_id, channel_id = channel_id, self_mute = false, self_deaf = true };
-        discord_update_voice_state(client, *update);
-        return sprint("Joining <#%>.", channel_id);
+        stopped := player_stop();
+        defer free(stopped);
+        if !stopped  return copy_string("Nothing is playing.");
+        return sprint("Stopped `%`.", stopped);
     }
 
     if name == "leave" {
@@ -251,20 +324,159 @@ command_handle :: (client: *void, event: *Discord_Interaction) -> string {
     return sprint("Unrecognized command: `%`.", name);
 }
 
-channel_option :: (data: *Discord_Interaction_Data, name: string) -> id: u64, found: bool {
-    if !data.options return 0, false;
+join_and_play :: (client: *void, guild_id: u64, channel_id: u64, file: string) -> string {
+    if voice.guild_id != 0 && voice.guild_id != guild_id
+        return copy_string("Already connected in another server, doing nothing.");
 
-    for 0..data.options.size - 1 {
-        option := *data.options.array[it];
-        if to_string(option.name) != name continue;
+    playlist, error := build_playlist(file);
+    if error  return copy_string(error);
+    what := describe_playlist(playlist, file);
 
-        // IDs arrive as text, and Discord's JSON quotes them.
-        value := trim(to_string(option.value), "\"");
-        id, success := string_to_int(value, 10, u64);
-        return id, success;
+    if voice_ws_running && voice.guild_id == guild_id && voice.channel_id == channel_id {
+        player_play(playlist);
+        return sprint("Playing %.", what);
     }
 
-    return 0, false;
+    stop_voice_ws();
+    player_play(playlist);
+
+    voice.guild_id = guild_id;
+    voice.channel_id = channel_id;
+    voice.state_update_received = false;
+    voice.server_update_received = false;
+    update := Discord_Update_Voice_State.{ guild_id = guild_id, channel_id = channel_id, self_mute = false, self_deaf = true };
+    discord_update_voice_state(client, *update);
+    return sprint("Joining <#%> to play %.", channel_id, what);
+}
+
+build_playlist :: (start: string) -> [..]Track, error: string {
+    tracks := scan_music_folder();
+    if !start {
+        if !tracks.count  return tracks, "There are no audio files in the music folder.";
+        return tracks, "";
+    }
+
+    first, error := resolve_track(start);
+    if error {
+        free_tracks(*tracks);
+        return tracks, error;
+    }
+
+    playlist: [..]Track;
+    array_add(*playlist, first);
+    for * tracks {
+        if compare_tracks(<<it, first) > 0  array_add(*playlist, <<it);
+        else                                free_track(it);
+    }
+    array_free(tracks);
+    return playlist, "";
+}
+
+describe_playlist :: (playlist: [..]Track, start: string) -> string {
+    plural :: (n: s64) -> string { return ifx n == 1 then "" else "s"; }
+    if !start  return tprint("the music folder (% track%)", playlist.count, plural(playlist.count));
+    rest := playlist.count - 1;
+    if !rest  return tprint("`%`", playlist[0].name);
+    return tprint("`%`, then % more track% from the folder", playlist[0].name, rest, plural(rest));
+}
+
+scan_music_folder :: () -> [..]Track {
+    tracks: [..]Track;
+
+    visit :: (info: *File_Visit_Info, tracks: *[..]Track) {
+        if info.had_error  return;  // e.g. a broken symlink
+
+        name := slice(info.full_name, music_folder.count + 1, info.full_name.count - music_folder.count - 1);
+        for split(name, "/")  if begins_with(it, ".")  return;
+
+        extension, has_extension := path_extension(name);
+        if !has_extension || !array_find(AUDIO_EXTENSIONS, to_lower_copy(extension))  return;
+
+        path := info.full_name;
+        if info.is_symlink {
+            real, ok := get_absolute_path(path);
+            if !ok || !begins_with(real, tprint("%/", music_folder))  return;
+            path = real;
+        }
+        array_add(tracks, .{path = copy_string(path), name = copy_string(name)});
+    }
+
+    visit_files(music_folder, recursive = true, *tracks, visit, follow_directory_symlinks = false);
+    quick_sort(tracks, compare_tracks);
+    return tracks;
+}
+
+compare_tracks :: (a: Track, b: Track) -> s64 {
+    order := compare_nocase(a.name, b.name);
+    if order  return order;
+    return compare(a.name, b.name);
+}
+
+resolve_track :: (name: string) -> Track, error: string {
+    if is_absolute_path(name) || contains(name, "\\")
+        return .{}, tprint("`%` isn't a name inside the music folder.", name);
+    for split(name, "/")  if it == ".."
+        return .{}, tprint("`%` isn't a name inside the music folder.", name);
+
+    full := tprint("%/%", music_folder, name);
+    if !file_exists(full)  return .{}, tprint("There's no `%` in the music folder.", name);
+
+    real, ok := get_absolute_path(full);
+    if !ok || !begins_with(real, tprint("%/", music_folder))
+        return .{}, tprint("`%` leads outside the music folder.", name);
+    if is_directory(real)  return .{}, tprint("`%` is a folder.", name);
+
+    c_path := temp_c_string(real);
+    decoder := decoder_open(c_path);
+    if !decoder  return .{}, tprint("Can't decode `%`.", name);
+    decoder_close(decoder);
+
+    return .{path = copy_string(real), name = copy_string(name)}, "";
+}
+
+remember_voice_state :: (guild_id: u64, user_id: u64, channel_id: u64) {
+    for * voice_states {
+        if it.guild_id != guild_id || it.user_id != user_id  continue;
+        if channel_id  it.channel_id = channel_id;
+        else           remove it;
+        return;
+    }
+    if channel_id  array_add(*voice_states, .{guild_id, user_id, channel_id});
+}
+
+voice_channel_of :: (guild_id: u64, user_id: u64) -> u64 {
+    for voice_states  if it.guild_id == guild_id && it.user_id == user_id  return it.channel_id;
+    return 0;
+}
+
+find_option :: (data: *Discord_Interaction_Data, name: string) -> *Discord_Interaction_Option {
+    if !data.options return null;
+    for 0..data.options.size - 1 {
+        option := *data.options.array[it];
+        if to_string(option.name) == name  return option;
+    }
+    return null;
+}
+
+channel_option :: (data: *Discord_Interaction_Data, name: string) -> id: u64, found: bool {
+    option := find_option(data, name);
+    if !option || !option.value  return 0, false;
+
+    id, success := string_to_int(to_string(option.value), 10, u64);
+    return id, success;
+}
+
+string_option :: (data: *Discord_Interaction_Data, name: string) -> string, found: bool {
+    option := find_option(data, name);
+    if !option || !option.value  return "", false;
+
+    json := to_string(option.value);
+    if !json  return "", false;
+
+    buffer := cast(*u8) talloc(json.count + 1);
+    length := jsmnf_unescape(buffer, xx (json.count + 1), json.data, xx json.count);
+    if length <= 0  return "", false;
+    return .{length, buffer}, true;
 }
 
 send_reply :: (client: *void, event: *Discord_Interaction, text: string) {
@@ -278,6 +490,67 @@ send_reply :: (client: *void, event: *Discord_Interaction, text: string) {
     ret := Discord_Ret.{fail = on_request_failed};
     code := discord_create_interaction_response(client, event.id, event.token, *response, *ret);
     report_if_failed("Couldn't reply", client, code);
+}
+
+send_file_suggestions :: (client: *void, event: *Discord_Interaction) {
+    query := string_option(event.data, "file");
+    words := split(to_lower_copy(query), " ");
+
+    tracks := scan_music_folder();
+    defer free_tracks(*tracks);
+
+    choices: [DISCORD_MAX_AUTOCOMPLETE_CHOICES]Discord_Command_Option_Choice;
+    count := 0;
+    for tracks {
+        if count == choices.count  break;
+        if character_count(it.name) > DISCORD_MAX_CHOICE_LENGTH  continue;
+        if !matches_all(to_lower_copy(it.name), words)  continue;
+
+        choices[count] = .{name = temp_c_string(it.name), value = temp_c_string(json_quote(it.name))};
+        count += 1;
+    }
+
+    list: Discord_List(Discord_Command_Option_Choice);
+    list.size = xx count;
+    list.array = choices.data;
+
+    data: Discord_Interaction_Callback_Data;
+    data.choices = *list;
+    response := Discord_Interaction_Response.{type = DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE_RESULT, data = *data};
+
+    ret := Discord_Ret.{fail = on_request_failed};
+    code := discord_create_interaction_response(client, event.id, event.token, *response, *ret);
+    report_if_failed("Couldn't send suggestions", client, code);
+}
+
+matches_all :: (text: string, words: []string) -> bool {
+    for words  if it && !contains(text, it)  return false;
+    return true;
+}
+
+character_count :: (s: string) -> s64 {
+    count := 0;
+    for 0..s.count - 1  if (s[it] & 0xC0) != 0x80  count += 1;
+    return count;
+}
+
+json_quote :: (s: string) -> string {
+    builder: String_Builder;
+    builder.allocator = temp;
+    append(*builder, "\"");
+    for 0..s.count - 1 {
+        c := s[it];
+        if c == #char "\"" || c == #char "\\" {
+            append(*builder, "\\");
+            append(*builder, c);
+        } else if c < 0x20 {
+            print_to_builder(*builder, "\\u%", formatInt(c, base = 16, minimum_digits = 4));
+        } else {
+            append(*builder, c);
+        }
+    }
+    append(*builder, "\"");
+    return builder_to_string(*builder,, temp);
 }
 
 build_reply :: (response: *Discord_Interaction_Response, data: *Discord_Interaction_Callback_Data, content: *u8) {
@@ -300,9 +573,11 @@ register_commands :: (client: *void, application_id: u64) {
 Command_List :: struct {
     audio_channel_types: [2]s32;
     channel_types: Discord_List(s32);
-    join_options: [1]Discord_Command_Option;
+    join_options: [2]Discord_Command_Option;
     join_option_list: Discord_List(Discord_Command_Option);
-    commands: [2]Discord_Command;
+    play_options: [1]Discord_Command_Option;
+    play_option_list: Discord_List(Discord_Command_Option);
+    commands: [4]Discord_Command;
     list: Discord_List(Discord_Command);
 }
 
@@ -312,30 +587,42 @@ build_commands :: (out: *Command_List) {
     out.channel_types.size = xx out.audio_channel_types.count;
     out.channel_types.array = out.audio_channel_types.data;
 
+    file_option :: (option: *Discord_Command_Option) {
+        option.type = DISCORD_APPLICATION_OPTION_STRING;
+        option.name = "file";
+        option.description = "File to start from, inside the music folder (default: the first one)";
+        option.required = false;
+        option.autocomplete = true;
+    }
+
     channel := *out.join_options[0];
     channel.type = DISCORD_APPLICATION_OPTION_CHANNEL;
     channel.name = "channel";
     channel.description = "Audio channel to join";
     channel.required = true;
     channel.channel_types = *out.channel_types;
+    file_option(*out.join_options[1]);
 
     out.join_option_list.size = xx out.join_options.count;
     out.join_option_list.array = out.join_options.data;
 
-    join := *out.commands[0];
-    join.type = DISCORD_APPLICATION_CHAT_INPUT;
-    join.name = "join";
-    join.description = "Join an audio channel";
-    join.options = *out.join_option_list;
-    join.default_member_permissions = DISCORD_PERMISSION_ADMINISTRATOR;
-    join.default_permission = true;
+    file_option(*out.play_options[0]);
+    out.play_option_list.size = xx out.play_options.count;
+    out.play_option_list.array = out.play_options.data;
 
-    leave := *out.commands[1];
-    leave.type = DISCORD_APPLICATION_CHAT_INPUT;
-    leave.name = "leave";
-    leave.description = "Leave the audio channel";
-    leave.default_member_permissions = DISCORD_PERMISSION_ADMINISTRATOR;
-    leave.default_permission = true;
+    command :: (c: *Discord_Command, name: *u8, description: *u8, options: *Discord_List(Discord_Command_Option) = null) {
+        c.type = DISCORD_APPLICATION_CHAT_INPUT;
+        c.name = name;
+        c.description = description;
+        c.options = options;
+        c.default_member_permissions = DISCORD_PERMISSION_ADMINISTRATOR;
+        c.default_permission = true;
+    }
+
+    command(*out.commands[0], "play",  "Join your audio channel and play the music folder", *out.play_option_list);
+    command(*out.commands[1], "join",  "Join an audio channel and play the music folder", *out.join_option_list);
+    command(*out.commands[2], "stop",  "Stop playing");
+    command(*out.commands[3], "leave", "Leave the audio channel");
 
     out.list.size = xx out.commands.count;
     out.list.array = out.commands.data;
@@ -380,6 +667,7 @@ start_voice_ws :: () {
         return;
     }
     init(*voice_ws.dave_mutex, "dave");
+    init(*voice_ws.curl_mutex, "curl");
     voice_thread.data = *voice_ws;
     thread_start(*voice_thread);
     voice_ws_running = true;
@@ -398,12 +686,14 @@ stop_voice_ws :: () {
     array_free(voice_ws.users_in_call);
     array_free(voice_ws.dave_pending_transitions);
     destroy(*voice_ws.dave_mutex);
+    destroy(*voice_ws.curl_mutex);
     voice_ws = .{};
     voice_ws_running = false;
 }
 
 reset_voice :: () {
     stop_voice_ws();
+    free(player_stop());
     voice = .{};
 }
 
@@ -431,10 +721,7 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
         if ws.heartbeat_interval_ms > 0 && current_time_monotonic() >= ws.next_heartbeat
             if !ws_send_heartbeat(ws)  break;
 
-        if !ws.audio_started && audio_ready(ws) {
-            if !ws_send_speaking(ws, 1)  break;
-            audio_start(ws);
-        }
+        if !ws.audio_started && audio_ready(ws)  audio_start(ws);
 
         gotta_stop = atomic_read(*ws.stop_requested);
     }
@@ -481,7 +768,9 @@ ws_drain :: (ws: *Voice_Ws) -> bool {
     meta: *Curl_Ws_Frame;
     
     while (true) {
+        lock(*ws.curl_mutex);
         ret := curl_ws_recv(ws.curl, ws.rx.data + ws.rx_len, xx (ws.rx.count - ws.rx_len), *got, *meta);
+        unlock(*ws.curl_mutex);
         if ret == {
             case CURLE_AGAIN; return true;
             case CURLE_OK;
@@ -780,7 +1069,9 @@ ws_send_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
     memcpy(message + 1, payload.data, payload.count);
 
     sent: u64;
+    lock(*ws.curl_mutex);
     ret := curl_ws_send(ws.curl, message, xx (payload.count + 1), *sent, 0, CURLWS_BINARY);
+    unlock(*ws.curl_mutex);
     if ret != CURLE_OK || sent != xx (payload.count + 1) {
         print("Voice WS binary send failed: % (sent % of %)\n", to_string(curl_easy_strerror(ret)), sent, payload.count + 1);
         return false;
@@ -820,7 +1111,9 @@ ws_send_transition_op :: (ws: *Voice_Ws, op: s64, transition_id: u16) -> bool {
 
 ws_send_text :: (ws: *Voice_Ws, text: string) -> bool {
     sent: u64;
+    lock(*ws.curl_mutex);
     ret := curl_ws_send(ws.curl, text.data, xx text.count, *sent, 0, CURLWS_TEXT);
+    unlock(*ws.curl_mutex);
     if ret != CURLE_OK || sent != xx text.count {
         print("Voice WS send failed: % (sent % of %)\n", to_string(curl_easy_strerror(ret)), sent, text.count);
         return false;
@@ -991,7 +1284,6 @@ dave_execute_transition :: (ws: *Voice_Ws, transition_id: u16) {
     print("DAVE: execute for transition %, which wasn't prepared\n", transition_id);
 }
 
-// Points our encryptor at our own key ratchet, or at passthrough for version 0.
 dave_use_version :: (ws: *Voice_Ws, version: u16) {
     if version == 0 {
         daveEncryptorSetPassthroughMode(ws.dave_encryptor, true);
@@ -1221,9 +1513,20 @@ audio_stop_and_join :: (ws: *Voice_Ws) {
     ws.audio_thread = .{};
 }
 
+// Runs for the whole voice connection: waits for a playlist, plays it, and waits again.
 audio_thread_proc :: (thread: *Thread) -> s64 {
     ws := cast(*Voice_Ws) thread.data;
-    play_file(ws, TESTFILE);
+
+    while !atomic_read(*ws.audio_stop) {
+        reset_temporary_storage();
+        playlist, found := player_take_pending();
+        if !found {
+            wait_for(*player.wake, PLAYER_IDLE_WAIT_MS);
+            continue;
+        }
+        play_playlist(ws, playlist);
+        player_finish();
+    }
     return 0;
 }
 
@@ -1232,17 +1535,13 @@ Audio_Stats :: struct {
     failed: s64;
 }
 
-play_file :: (ws: *Voice_Ws, path: string) {
-    c_path := to_c_string(path);
-    defer free(c_path);
+Track_End :: enum {
+    FINISHED;
+    STOPPED;
+    CUT_OFF;
+}
 
-    dec := decoder_open(c_path);
-    if !dec {
-        print("Audio: couldn't open %\n", path);
-        return;
-    }
-    defer decoder_close(dec);
-
+play_playlist :: (ws: *Voice_Ws, playlist: []Track) {
     opus_err: s32;
     opus_enc := opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, *opus_err);
     if !opus_enc {
@@ -1251,46 +1550,71 @@ play_file :: (ws: *Voice_Ws, path: string) {
     }
     defer opus_encoder_destroy(opus_enc);
 
-    print("Audio: playing %\n", path);
+    if !ws_send_speaking(ws, 1)  return;
+
+    stats: Audio_Stats;
+    next_frame := current_time_monotonic();
+    ending := Track_End.FINISHED;
+
+    for playlist {
+        player_set_current(it_index);
+        print("Audio: playing % (%/%)\n", it.name, it_index + 1, playlist.count);
+        ending = play_track(ws, opus_enc, it, *next_frame, *stats);
+        if ending != .FINISHED  break;
+    }
+
+    if ending == .CUT_OFF {
+        print("Audio: cut off (% frames sent, % failed)\n", stats.sent, stats.failed);
+        return;
+    }
+
+    for 1..SILENCE_FRAME_COUNT {
+        if atomic_read(*ws.audio_stop)  return;
+        send_frame_on_schedule(ws, SILENCE_FRAME, *next_frame, milliseconds_to_apollo(FRAME_MS), *stats);
+    }
+    ws_send_speaking(ws, 0);
+
+    print("Audio: % (% frames sent, % failed)\n", ifx ending == .STOPPED then "stopped" else "playlist finished", stats.sent, stats.failed);
+}
+
+play_track :: (ws: *Voice_Ws, opus_enc: *void, track: Track, next_frame: *Apollo_Time, stats: *Audio_Stats) -> Track_End {
+    dec := decoder_open(temp_c_string(track.path));
+    if !dec {
+        print("Audio: couldn't open %, skipping it\n", track.name);
+        return .FINISHED;
+    }
+    defer decoder_close(dec);
 
     pcm: [2 * FRAME_SIZE]s16;
     opus: [OPUS_MAX_PACKET]u8;
-    stats: Audio_Stats;
     frame_duration := milliseconds_to_apollo(FRAME_MS);
-    next_frame := current_time_monotonic();
-    stopped := false;
 
     while true {
         reset_temporary_storage();
-        if atomic_read(*ws.audio_stop) { stopped = true; break; }
+        if atomic_read(*ws.audio_stop)  return .CUT_OFF;
+        if atomic_read(*player.stop_requested)  return .STOPPED;
 
         frames_read := decoder_read(dec, pcm.data, FRAME_SIZE);
         if frames_read < 0 {
-            print("Audio: decoding % failed\n", path);
-            break;
+            print("Audio: decoding % failed, skipping the rest of it\n", track.name);
+            return .FINISHED;
         }
-        if frames_read == 0  break;
+        // A file that ends exactly on a frame boundary gets here with 0 frames.
+        // Stopping now, instead of padding, avoids sending an extra frame of silence.
+        if frames_read == 0  return .FINISHED;
         if frames_read < FRAME_SIZE
             memset(pcm.data + 2 * frames_read, 0, (2 * FRAME_SIZE - 2 * frames_read) * size_of(s16));
 
         bytes := opus_encode(opus_enc, pcm.data, FRAME_SIZE, opus.data, opus.count);
         if bytes < 0 {
-            print("Audio: Opus encoding failed: %\n", to_string(opus_strerror(bytes)));
-            break;
+            print("Audio: Opus encoding failed in %: %\n", track.name, to_string(opus_strerror(bytes)));
+            return .FINISHED;
         }
 
-        send_frame_on_schedule(ws, .{xx bytes, opus.data}, *next_frame, frame_duration, *stats);
-        if frames_read < FRAME_SIZE  break;
+        send_frame_on_schedule(ws, .{xx bytes, opus.data}, next_frame, frame_duration, stats);
+        if frames_read < FRAME_SIZE  return .FINISHED;
     }
-
-    if !stopped {
-        for 1..SILENCE_FRAME_COUNT {
-            if atomic_read(*ws.audio_stop) { stopped = true; break; }
-            send_frame_on_schedule(ws, SILENCE_FRAME, *next_frame, frame_duration, *stats);
-        }
-    }
-
-    print("Audio: % % (% frames sent, % failed)\n", ifx stopped then "stopped" else "finished", path, stats.sent, stats.failed);
+    return .FINISHED;
 }
 
 send_frame_on_schedule :: (ws: *Voice_Ws, opus: []u8, next_frame: *Apollo_Time, frame_duration: Apollo_Time, stats: *Audio_Stats) {
@@ -1362,4 +1686,72 @@ wait_until :: (deadline: Apollo_Time) {
         if remaining <= 0  return;
         sleep_milliseconds(xx ((remaining + 999) / 1000));
     }
+}
+
+
+//
+// Player requests
+//
+
+player_play :: (playlist: [..]Track) {
+    lock(*player.mutex);
+    free_tracks(*player.pending);
+    player.pending = playlist;
+    if player.playing.count  atomic_write(*player.stop_requested, true);
+    unlock(*player.mutex);
+    signal(*player.wake);
+}
+
+// Returns the name of the track it stopped, or of the first one waiting to start.
+// The caller frees it. Empty when nothing was playing or waiting.
+player_stop :: () -> string {
+    lock(*player.mutex);
+    defer unlock(*player.mutex);
+
+    stopped: string;
+    if player.current >= 0 {
+        atomic_write(*player.stop_requested, true);
+        stopped = copy_string(player.playing[player.current].name);
+    } else if player.pending.count {
+        stopped = copy_string(player.pending[0].name);
+    }
+    free_tracks(*player.pending);
+    return stopped;
+}
+
+player_take_pending :: () -> []Track, found: bool {
+    lock(*player.mutex);
+    defer unlock(*player.mutex);
+
+    if !player.pending.count  return .[], false;
+    player.playing = player.pending;
+    player.pending = [..]Track.{};
+    player.current = -1;
+    atomic_write(*player.stop_requested, false);
+    return player.playing, true;
+}
+
+player_set_current :: (index: s64) {
+    lock(*player.mutex);
+    player.current = index;
+    unlock(*player.mutex);
+}
+
+player_finish :: () {
+    lock(*player.mutex);
+    free_tracks(*player.playing);
+    player.current = -1;
+    unlock(*player.mutex);
+}
+
+free_track :: (track: *Track) {
+    free(track.path);
+    free(track.name);
+    <<track = .{};
+}
+
+free_tracks :: (tracks: *[..]Track) {
+    for * <<tracks  free_track(it);
+    array_free(<<tracks);
+    <<tracks = [..]Track.{};
 }
