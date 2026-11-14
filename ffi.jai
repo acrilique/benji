@@ -18,9 +18,6 @@ decoder_close :: (decoder: *void) -> void #foreign decoder;
 opus_encoder_create :: (Fs: s32, channels: s32, application: s32, error: *s32) -> *void #foreign opus;
 opus_encoder_destroy :: (st: *void) -> void #foreign opus;
 opus_encode :: (st: *void, pcm: *s16, frame_size: s32, data: *u8, max_data_bytes: s32) -> s32 #foreign opus;
-opus_decoder_create :: (Fs: s32, channels: s32, error: *s32) -> *void #foreign opus;
-opus_decoder_destroy :: (st: *void) -> void #foreign opus;
-opus_decode :: (st: *void, data: *u8, len: s32, pcm: *s16, frame_size: s32, decode_fec: s32) -> s32 #foreign opus;
 opus_strerror :: (error: s32) -> *u8 #foreign opus;
 
 //
@@ -283,7 +280,6 @@ discord_set_on_ready :: (client: *void, callback: #type (client: *void, event: *
 discord_set_on_interaction_create :: (client: *void, callback: #type (client: *void, event: *Discord_Interaction) #c_call) -> void #foreign discord;
 discord_set_on_guild_create :: (client: *void, callback: #type (client: *void, event: *Discord_Guild) #c_call) -> void #foreign discord;
 discord_run :: (client: *void) -> s32 #foreign discord;
-discord_shutdown :: (client: *void) -> void #foreign discord;
 discord_cleanup :: (client: *void) -> void #foreign discord;
 discord_strerror :: (code: s32, client: *void) -> *u8 #foreign discord;
 
@@ -303,7 +299,6 @@ DAVE_Commit_Result  :: *void;
 DAVE_Welcome_Result :: *void;
 DAVE_Key_Ratchet    :: *void;
 DAVE_Encryptor      :: *void;
-DAVE_Decryptor      :: *void;
 
 DAVE_Codec :: enum s32 {
     UNKNOWN :: 0;
@@ -328,14 +323,6 @@ DAVE_Encryptor_Result :: enum s32 {
     TOO_MANY_ATTEMPTS   :: 4;
 }
 
-DAVE_Decryptor_Result :: enum s32 {
-    SUCCESS             :: 0;
-    DECRYPTION_FAILURE  :: 1;
-    MISSING_KEY_RATCHET :: 2;
-    INVALID_NONCE       :: 3;
-    MISSING_CRYPTOR     :: 4;
-}
-
 DAVE_Logging_Severity :: enum s32 {
     VERBOSE :: 0;
     INFO    :: 1;
@@ -344,35 +331,9 @@ DAVE_Logging_Severity :: enum s32 {
     NONE    :: 4;
 }
 
-DAVE_Encryptor_Stats :: struct {
-    passthrough_count:         u64;
-    encrypt_success_count:     u64;
-    encrypt_failure_count:     u64;
-    encrypt_duration:          u64;
-    encrypt_attempts:          u64;
-    encrypt_max_attempts:      u64;
-    encrypt_missing_key_count: u64;
-}
-
-DAVE_Decryptor_Stats :: struct {
-    passthrough_count:           u64;
-    decrypt_success_count:       u64;
-    decrypt_failure_count:       u64;
-    decrypt_duration:            u64;
-    decrypt_attempts:            u64;
-    decrypt_missing_key_count:   u64;
-    decrypt_invalid_nonce_count: u64;
-}
-
-#assert size_of(DAVE_Encryptor_Stats) == 56;
-#assert size_of(DAVE_Decryptor_Stats) == 56;
-
 DAVE_MLS_Failure_Callback :: #type (source: *u8, reason: *u8, user_data: *void) #c_call;
-DAVE_Pairwise_Fingerprint_Callback :: #type (fingerprint: *u8, length: u64, user_data: *void) #c_call;
-DAVE_Protocol_Version_Changed_Callback :: #type (user_data: *void) #c_call;
 DAVE_Log_Sink_Callback :: #type (severity: DAVE_Logging_Severity, file: *u8, line: s32, message: *u8) #c_call;
 
-daveMaxSupportedProtocolVersion :: () -> u16 #foreign dave;
 daveFree :: (ptr: *void) -> void #foreign dave;
 daveSetLogSinkCallback :: (callback: DAVE_Log_Sink_Callback) -> void #foreign dave;
 
@@ -380,9 +341,7 @@ daveSessionCreate :: (ctx: *void, auth_session_id: *u8, callback: DAVE_MLS_Failu
 daveSessionDestroy :: (session: DAVE_Session) -> void #foreign dave;
 daveSessionInit :: (session: DAVE_Session, version: u16, group_id: u64, self_user_id: *u8) -> void #foreign dave;
 daveSessionReset :: (session: DAVE_Session) -> void #foreign dave;
-daveSessionSetProtocolVersion :: (session: DAVE_Session, version: u16) -> void #foreign dave;
 daveSessionGetProtocolVersion :: (session: DAVE_Session) -> u16 #foreign dave;
-daveSessionGetLastEpochAuthenticator :: (session: DAVE_Session, authenticator: **u8, length: *u64) -> void #foreign dave;
 daveSessionSetExternalSender :: (session: DAVE_Session, external_sender: *u8, length: u64) -> void #foreign dave;
 daveSessionAddRecognizedUser :: (session: DAVE_Session, user_id: *u8) -> void #foreign dave;
 daveSessionRemoveRecognizedUser :: (session: DAVE_Session, user_id: *u8) -> void #foreign dave;
@@ -393,18 +352,13 @@ daveSessionProcessCommit :: (session: DAVE_Session, commit: *u8, length: u64) ->
 daveSessionProcessWelcome :: (session: DAVE_Session, welcome: *u8, length: u64) -> DAVE_Welcome_Result #foreign dave;
 daveSessionGetMarshalledKeyPackage :: (session: DAVE_Session, key_package: **u8, length: *u64) -> void #foreign dave;
 daveSessionGetKeyRatchet :: (session: DAVE_Session, user_id: *u8) -> DAVE_Key_Ratchet #foreign dave;
-daveSessionGetPairwiseFingerprint :: (session: DAVE_Session, version: u16, user_id: *u8, callback: DAVE_Pairwise_Fingerprint_Callback, user_data: *void) -> void #foreign dave;
 
 daveKeyRatchetDestroy :: (key_ratchet: DAVE_Key_Ratchet) -> void #foreign dave;
 
 daveCommitResultIsFailed :: (result: DAVE_Commit_Result) -> bool #foreign dave;
 daveCommitResultIsIgnored :: (result: DAVE_Commit_Result) -> bool #foreign dave;
-daveCommitResultGetRosterMemberIds :: (result: DAVE_Commit_Result, roster_ids: **u64, roster_ids_length: *u64) -> void #foreign dave;
-daveCommitResultGetRosterMemberSignature :: (result: DAVE_Commit_Result, roster_id: u64, signature: **u8, signature_length: *u64) -> void #foreign dave;
 daveCommitResultDestroy :: (result: DAVE_Commit_Result) -> void #foreign dave;
 
-daveWelcomeResultGetRosterMemberIds :: (result: DAVE_Welcome_Result, roster_ids: **u64, roster_ids_length: *u64) -> void #foreign dave;
-daveWelcomeResultGetRosterMemberSignature :: (result: DAVE_Welcome_Result, roster_id: u64, signature: **u8, signature_length: *u64) -> void #foreign dave;
 daveWelcomeResultDestroy :: (result: DAVE_Welcome_Result) -> void #foreign dave;
 
 daveEncryptorCreate :: () -> DAVE_Encryptor #foreign dave;
@@ -413,21 +367,8 @@ daveEncryptorDestroy :: (encryptor: DAVE_Encryptor) -> void #foreign dave;
 daveEncryptorSetKeyRatchet :: (encryptor: DAVE_Encryptor, key_ratchet: DAVE_Key_Ratchet) -> void #foreign dave;
 daveEncryptorSetPassthroughMode :: (encryptor: DAVE_Encryptor, passthrough: bool) -> void #foreign dave;
 daveEncryptorAssignSsrcToCodec :: (encryptor: DAVE_Encryptor, ssrc: u32, codec: DAVE_Codec) -> void #foreign dave;
-daveEncryptorGetProtocolVersion :: (encryptor: DAVE_Encryptor) -> u16 #foreign dave;
 daveEncryptorGetMaxCiphertextByteSize :: (encryptor: DAVE_Encryptor, media_type: DAVE_Media_Type, frame_size: u64) -> u64 #foreign dave;
-daveEncryptorHasKeyRatchet :: (encryptor: DAVE_Encryptor) -> bool #foreign dave;
-daveEncryptorIsPassthroughMode :: (encryptor: DAVE_Encryptor) -> bool #foreign dave;
 daveEncryptorEncrypt :: (encryptor: DAVE_Encryptor, media_type: DAVE_Media_Type, ssrc: u32, frame: *u8, frame_length: u64, encrypted_frame: *u8, encrypted_frame_capacity: u64, bytes_written: *u64) -> DAVE_Encryptor_Result #foreign dave;
-daveEncryptorSetProtocolVersionChangedCallback :: (encryptor: DAVE_Encryptor, callback: DAVE_Protocol_Version_Changed_Callback, user_data: *void) -> void #foreign dave;
-daveEncryptorGetStats :: (encryptor: DAVE_Encryptor, media_type: DAVE_Media_Type, stats: *DAVE_Encryptor_Stats) -> void #foreign dave;
-
-daveDecryptorCreate :: () -> DAVE_Decryptor #foreign dave;
-daveDecryptorDestroy :: (decryptor: DAVE_Decryptor) -> void #foreign dave;
-daveDecryptorTransitionToKeyRatchet :: (decryptor: DAVE_Decryptor, key_ratchet: DAVE_Key_Ratchet) -> void #foreign dave;
-daveDecryptorTransitionToPassthroughMode :: (decryptor: DAVE_Decryptor, passthrough: bool) -> void #foreign dave;
-daveDecryptorDecrypt :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, encrypted_frame: *u8, encrypted_frame_length: u64, frame: *u8, frame_capacity: u64, bytes_written: *u64) -> DAVE_Decryptor_Result #foreign dave;
-daveDecryptorGetMaxPlaintextByteSize :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, encrypted_frame_size: u64) -> u64 #foreign dave;
-daveDecryptorGetStats :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, stats: *DAVE_Decryptor_Stats) -> void #foreign dave;
 
 //
 // Foreign bindings: OpenSSL's libcrypto, for the AES-256-GCM transport encryption
@@ -456,33 +397,18 @@ CURL :: void;
 curl_off_t :: s64;
 curl_socket_t :: s32;
 
-CURL_GLOBAL_DEFAULT :: 3;
+CURLE_OK    :: 0;
+CURLE_AGAIN :: 81;  // nothing to read, or the socket can't take more yet
 
-CURLE_OK          :: 0;
-CURLE_GOT_NOTHING :: 52;  // the server closed the connection
-CURLE_SEND_ERROR  :: 55;
-CURLE_RECV_ERROR  :: 56;
-CURLE_AGAIN       :: 81;  // nothing to read, or the socket can't take more yet
-
-CURLOPT_VERBOSE           :: 41;
 CURLOPT_CONNECT_ONLY      :: 141;  // set to 2 for WebSocket: stop after the upgrade
 CURLOPT_CONNECTTIMEOUT_MS :: 156;
-CURLOPT_WS_OPTIONS        :: 320;
 CURLOPT_URL               :: 10002;
 
 CURLINFO_ACTIVESOCKET :: 0x500000 + 44;
 
 CURLWS_TEXT   :: 1 << 0;
 CURLWS_BINARY :: 1 << 1;
-CURLWS_CONT   :: 1 << 2;
 CURLWS_CLOSE  :: 1 << 3;
-CURLWS_PING   :: 1 << 4;
-CURLWS_OFFSET :: 1 << 5;
-CURLWS_PONG   :: 1 << 6;
-
-// For CURLOPT_WS_OPTIONS.
-CURLWS_RAW_MODE   :: 1 << 0;
-CURLWS_NOAUTOPONG :: 1 << 1;
 
 Curl_Ws_Frame :: struct {
     age: s32;
@@ -494,8 +420,6 @@ Curl_Ws_Frame :: struct {
 
 #assert size_of(Curl_Ws_Frame) == 32;
 
-curl_global_init :: (flags: s64) -> s32 #foreign libcurl;
-curl_global_cleanup :: () -> void #foreign libcurl;
 curl_easy_init :: () -> *CURL #foreign libcurl;
 curl_easy_cleanup :: (curl: *CURL) -> void #foreign libcurl;
 curl_easy_perform :: (curl: *CURL) -> s32 #foreign libcurl;
@@ -509,21 +433,10 @@ curl_easy_getinfo_socket :: (curl: *CURL, info: s32, out: *curl_socket_t) -> s32
 
 curl_ws_recv :: (curl: *CURL, buffer: *void, buflen: u64, recv: *u64, meta: **Curl_Ws_Frame) -> s32 #foreign libcurl;
 curl_ws_send :: (curl: *CURL, buffer: *void, buflen: u64, sent: *u64, fragsize: curl_off_t, flags: u32) -> s32 #foreign libcurl;
-curl_ws_meta :: (curl: *CURL) -> *Curl_Ws_Frame #foreign libcurl;
 
 //
-// Foreign bindings: Concord's JSON libraries (jsmn + jsmn-find to parse, json-build to build)
+// Foreign bindings: Concord's JSON libraries (jsmn + jsmn-find)
 //
-
-JSMN_UNDEFINED :: 0;
-JSMN_OBJECT    :: 1;
-JSMN_ARRAY     :: 2;
-JSMN_STRING    :: 3;
-JSMN_PRIMITIVE :: 4;  // numbers, true, false, null
-
-JSMN_ERROR_NOMEM :: -1;  // not enough tokens or pairs
-JSMN_ERROR_INVAL :: -2;  // invalid character
-JSMN_ERROR_PART  :: -3;  // incomplete JSON
 
 Jsmn_Token :: struct {
     type: s32;
@@ -557,45 +470,16 @@ Jsmnf_Loader :: struct {
     pairnext: u32;
 }
 
-JSONB_OK          :: 0;
-JSONB_END         :: 1;
-JSONB_ERROR_NOMEM :: -1;  // the output buffer is too small
-JSONB_ERROR_INPUT :: -2;
-JSONB_ERROR_STACK :: -3;
-
-JSONB_MAX_DEPTH :: 128;
-
-Jsonb :: struct {
-    stack: [JSONB_MAX_DEPTH + 1]s32;
-    top: *s32;
-    pos: u64;  // bytes written to the buffer so far
-}
-
 #assert size_of(Jsmn_Token) == 16;
 #assert size_of(Jsmn_Parser) == 12;
 #assert size_of(Jsmnf_Tok) == 16;
 #assert size_of(Jsmnf_Pair) == 64;
 #assert size_of(Jsmnf_Loader) == 4;
-#assert size_of(Jsonb) == 536;
 
 jsmn_init :: (parser: *Jsmn_Parser) -> void #foreign discord;
 jsmn_parse :: (parser: *Jsmn_Parser, js: *u8, len: u64, tokens: *Jsmn_Token, num_tokens: u32) -> s32 #foreign discord;
-jsmn_parse_auto :: (parser: *Jsmn_Parser, js: *u8, length: u64, p_tokens: **Jsmn_Token, num_tokens: *u32) -> s32 #foreign discord;
 jsmnf_init :: (loader: *Jsmnf_Loader) -> void #foreign discord;
 jsmnf_load :: (loader: *Jsmnf_Loader, js: *u8, tokens: *Jsmn_Token, num_tokens: u32, pairs: *Jsmnf_Pair, num_pairs: u32) -> s32 #foreign discord;
-jsmnf_load_auto :: (loader: *Jsmnf_Loader, js: *u8, tokens: *Jsmn_Token, num_tokens: u32, p_pairs: **Jsmnf_Pair, num_pairs: *u32) -> s32 #foreign discord;
 jsmnf_find :: (head: *Jsmnf_Pair, js: *u8, key: *u8, length: s32) -> *Jsmnf_Pair #foreign discord;
-jsmnf_find_path :: (head: *Jsmnf_Pair, js: *u8, path: **u8, depth: u32) -> *Jsmnf_Pair #foreign discord;
 jsmnf_unescape :: (buf: *u8, bufsize: u64, src: *u8, length: u64) -> s64 #foreign discord;
 
-jsonb_init :: (b: *Jsonb) -> void #foreign discord;
-jsonb_object :: (b: *Jsonb, buf: *u8, bufsize: u64) -> s32 #foreign discord;
-jsonb_object_pop :: (b: *Jsonb, buf: *u8, bufsize: u64) -> s32 #foreign discord;
-jsonb_key :: (b: *Jsonb, buf: *u8, bufsize: u64, key: *u8, len: u64) -> s32 #foreign discord;
-jsonb_array :: (b: *Jsonb, buf: *u8, bufsize: u64) -> s32 #foreign discord;
-jsonb_array_pop :: (b: *Jsonb, buf: *u8, bufsize: u64) -> s32 #foreign discord;
-jsonb_token :: (b: *Jsonb, buf: *u8, bufsize: u64, token: *u8, len: u64) -> s32 #foreign discord;
-jsonb_bool :: (b: *Jsonb, buf: *u8, bufsize: u64, boolean: s32) -> s32 #foreign discord;
-jsonb_null :: (b: *Jsonb, buf: *u8, bufsize: u64) -> s32 #foreign discord;
-jsonb_string :: (b: *Jsonb, buf: *u8, bufsize: u64, str: *u8, len: u64) -> s32 #foreign discord;
-jsonb_number :: (b: *Jsonb, buf: *u8, bufsize: u64, number: float64) -> s32 #foreign discord;
