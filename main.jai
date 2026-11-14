@@ -25,6 +25,9 @@ VOICE_MODE :: "aead_xchacha20_poly1305_rtpsize";
 IP_DISCOVERY_ATTEMPTS   :: 3;
 IP_DISCOVERY_TIMEOUT_MS :: 1000;
 
+DAVE_INIT_TRANSITION_ID :: 0;
+DAVE_NEW_GROUP_EPOCH    :: 1;
+
 Args :: struct {
     music_folder: string;
 }
@@ -40,6 +43,7 @@ main :: () {
     }
 
     print("Music folder: %\n", args.music_folder);
+    daveSetLogSinkCallback(on_dave_log);
     client := discord_init(to_c_string(token));
     if !client {
         print("Failed to initialize discord client\n");
@@ -79,6 +83,7 @@ voice: Voice_Connection;
 Voice_Ws :: struct {
     endpoint, session_id, token: string;
     guild_id: u64;
+    channel_id: u64;  // also the DAVE group ID
 
     stop_requested: bool;
 
@@ -100,6 +105,17 @@ Voice_Ws :: struct {
     dave_protocol_version: s32;
 
     users_in_call: [..]u64;
+
+    dave_mutex: Mutex;
+    dave: DAVE_Session;
+    dave_encryptor: DAVE_Encryptor;
+    dave_pending_transitions: [..]Dave_Transition;
+    dave_active_version: u16;
+}
+
+Dave_Transition :: struct {
+    id: u16;
+    protocol_version: u16;
 }
 
 voice_ws: Voice_Ws;
@@ -332,6 +348,7 @@ start_voice_ws :: () {
     voice_ws.session_id = copy_string(to_string(voice.session_id.data));
     voice_ws.token = copy_string(to_string(voice.token.data));
     voice_ws.guild_id = voice.guild_id;
+    voice_ws.channel_id = voice.channel_id;
 
     if !thread_init(*voice_thread, voice_ws_thread) {
         print("Failed to create the voice WS thread\n");
@@ -341,6 +358,7 @@ start_voice_ws :: () {
         voice_ws = .{};
         return;
     }
+    init(*voice_ws.dave_mutex, "dave");
     voice_thread.data = *voice_ws;
     thread_start(*voice_thread);
     voice_ws_running = true;
@@ -357,6 +375,8 @@ stop_voice_ws :: () {
     free(voice_ws.ip);
     free(voice_ws.external_ip);
     array_free(voice_ws.users_in_call);
+    array_free(voice_ws.dave_pending_transitions);
+    destroy(*voice_ws.dave_mutex);
     voice_ws = .{};
     voice_ws_running = false;
 }
@@ -375,6 +395,8 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
     if !ws_connect(ws) return 1;
     defer curl_easy_cleanup(ws.curl);
     defer close_and_reset(*ws.udp);
+    if !dave_create(ws)  return 1;
+    defer dave_destroy(ws);
 
     gotta_stop: bool;
 
@@ -464,7 +486,10 @@ ws_drain :: (ws: *Voice_Ws) -> bool {
 
                     ws.last_seq = ((cast(s64) msg[0]) << 8) | msg[1];
                     op := msg[2];
-                    print("<- binary op=% seq=% len=%\n", op, ws.last_seq, msg.count);
+                    payload: []u8;
+                    payload.data  = msg.data + 3;
+                    payload.count = msg.count - 3;
+                    if !handle_binary(ws, op, payload)  return false;
                 }
             case;
                 print("Connection lost: %\n", to_string(curl_easy_strerror(ret)));
@@ -555,6 +580,11 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
                 return false;
             }
 
+            {
+                dave_lock(ws);
+                daveEncryptorAssignSsrcToCodec(ws.dave_encryptor, ws.ssrc, .OPUS);
+            }
+
             if !udp_open(ws)         return false;
             if !udp_discover_ip(ws)  return false;
             if !ws_send_select_protocol(ws)  return false;
@@ -577,26 +607,178 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
             ws.have_session_description = true;
             print("<- Session Description: mode=% dave_protocol_version=% secret_key=(% bytes)\n",
                 json_text(mode, msg), ws.dave_protocol_version, ws.secret_key.count);
+
+            dave_lock(ws);
+            if !dave_protocol_init(ws, xx ws.dave_protocol_version)  return false;
         case 11; // Clients Connect
             ids := json_find(d, msg, "user_ids");
             if !ids  return true;
             for 0..ids.size-1 {
-                id, ok := string_to_int(json_text(*ids.fields[it], msg), 10, u64);
-                if ok  array_add_if_unique(*ws.users_in_call, id);
+                text := json_text(*ids.fields[it], msg);
+                id, ok := string_to_int(text, 10, u64);
+                if !ok  continue;
+                array_add_if_unique(*ws.users_in_call, id);
+                dave_lock(ws);
+                daveSessionAddRecognizedUser(ws.dave, temp_c_string(text));
             }
             print("<- Clients Connect: % user(s), % in the call\n", ids.size, ws.users_in_call.count);
         case 13; // Client Disconnect
             user := json_find(d, msg, "user_id");
             if !user  return true;
-            id, ok := string_to_int(json_text(user, msg), 10, u64);
+            text := json_text(user, msg);
+            id, ok := string_to_int(text, 10, u64);
             if ok  array_unordered_remove_by_value(*ws.users_in_call, id);
+            {
+                dave_lock(ws);
+                daveSessionRemoveRecognizedUser(ws.dave, temp_c_string(text));
+            }
             print("<- Client Disconnect: %, % in the call\n", id, ws.users_in_call.count);
         case 18; // Client Flags
         case 20; // Client Platform
+        case 21; // DAVE Prepare Transition
+            transition := json_find(d, msg, "transition_id");
+            version    := json_find(d, msg, "protocol_version");
+            if !transition || !version {
+                print("Prepare Transition is missing fields\n");
+                return true;
+            }
+            transition_id: u16 = xx string_to_int(json_text(transition, msg));
+            dave_lock(ws);
+            dave_prepare_transition(ws, transition_id, xx string_to_int(json_text(version, msg)));
+            if transition_id != DAVE_INIT_TRANSITION_ID  return ws_send_transition_op(ws, 23, transition_id);
+        case 22; // DAVE Execute Transition
+            transition := json_find(d, msg, "transition_id");
+            if !transition {
+                print("Execute Transition is missing transition_id\n");
+                return true;
+            }
+            dave_lock(ws);
+            dave_execute_transition(ws, xx string_to_int(json_text(transition, msg)));
+        case 24; // DAVE Prepare Epoch
+            epoch   := json_find(d, msg, "epoch");
+            version := json_find(d, msg, "protocol_version");
+            if !epoch || !version {
+                print("Prepare Epoch is missing fields\n");
+                return true;
+            }
+            epoch_number := string_to_int(json_text(epoch, msg));
+            dave_lock(ws);
+            dave_prepare_epoch(ws, epoch_number, xx string_to_int(json_text(version, msg)));
+            if epoch_number == DAVE_NEW_GROUP_EPOCH  return ws_send_key_package(ws);
         case;
             print("Unhandled \"op\" (%)\n", op);
     }
     return true;
+}
+
+handle_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
+    dave_lock(ws);
+
+    if op == {
+        case 25; // MLS External Sender Package
+            print("<- DAVE external sender (% bytes)\n", payload.count);
+            daveSessionSetExternalSender(ws.dave, payload.data, xx payload.count);
+        case 27; // MLS Proposals
+            print("<- DAVE proposals (% bytes)\n", payload.count);
+            commit_welcome: *u8;
+            commit_welcome_length: u64;
+            daveSessionProcessProposals(ws.dave, payload.data, xx payload.count, *commit_welcome, *commit_welcome_length);
+            if commit_welcome {
+                defer daveFree(commit_welcome);
+                return ws_send_binary(ws, 28, .{xx commit_welcome_length, commit_welcome});
+            }
+        case 29; // MLS Announce Commit Transition: [transition_id u16][commit]
+            if payload.count < 2 {
+                print("<- DAVE commit too short (% bytes)\n", payload.count);
+                return true;
+            }
+            transition_id := get_u16_be(payload.data);
+            print("<- DAVE commit for transition % (% bytes)\n", transition_id, payload.count - 2);
+
+            result := daveSessionProcessCommit(ws.dave, payload.data + 2, xx (payload.count - 2));
+            defer if result  daveCommitResultDestroy(result);
+
+            if result && daveCommitResultIsIgnored(result) {
+                print("DAVE: commit ignored\n");
+                return true;
+            }
+
+            if !result || daveCommitResultIsFailed(result) {
+                print("DAVE: commit failed, flagging it and rejoining\n");
+                if !ws_send_transition_op(ws, 31, transition_id)  return false;
+                return dave_protocol_init(ws, daveSessionGetProtocolVersion(ws.dave));
+            }
+
+            dave_prepare_transition(ws, transition_id, daveSessionGetProtocolVersion(ws.dave));
+            if transition_id != DAVE_INIT_TRANSITION_ID  return ws_send_transition_op(ws, 23, transition_id);
+        case 30; // MLS Welcome: [transition_id u16][welcome]
+            if payload.count < 2 {
+                print("<- DAVE welcome too short (% bytes)\n", payload.count);
+                return true;
+            }
+            transition_id := get_u16_be(payload.data);
+            print("<- DAVE welcome for transition % (% bytes)\n", transition_id, payload.count - 2);
+
+            result := daveSessionProcessWelcome(ws.dave, payload.data + 2, xx (payload.count - 2));
+            if !result {
+                print("DAVE: welcome failed, flagging it and sending a new key package\n");
+                if !ws_send_transition_op(ws, 31, transition_id)  return false;
+                return ws_send_key_package(ws);
+            }
+            daveWelcomeResultDestroy(result);
+
+            print("DAVE: joined the group\n");
+            dave_prepare_transition(ws, transition_id, daveSessionGetProtocolVersion(ws.dave));
+            if transition_id != DAVE_INIT_TRANSITION_ID  return ws_send_transition_op(ws, 23, transition_id);
+        case;
+            print("<- binary op=% seq=% (% bytes), unhandled\n", op, ws.last_seq, payload.count);
+    }
+    return true;
+}
+
+// Client binary messages have no sequence number: [op u8][payload].
+ws_send_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
+    message := cast(*u8) talloc(payload.count + 1);
+    message[0] = op;
+    memcpy(message + 1, payload.data, payload.count);
+
+    sent: u64;
+    ret := curl_ws_send(ws.curl, message, xx (payload.count + 1), *sent, 0, CURLWS_BINARY);
+    if ret != CURLE_OK || sent != xx (payload.count + 1) {
+        print("Voice WS binary send failed: % (sent % of %)\n", to_string(curl_easy_strerror(ret)), sent, payload.count + 1);
+        return false;
+    }
+    print("-> binary op=% (% bytes)\n", op, payload.count);
+    return true;
+}
+
+ws_send_key_package :: (ws: *Voice_Ws) -> bool {
+    key_package: *u8;
+    length: u64;
+    daveSessionGetMarshalledKeyPackage(ws.dave, *key_package, *length);
+    if !key_package {
+        print("DAVE: couldn't make a key package\n");
+        return false;
+    }
+    defer daveFree(key_package);
+    return ws_send_binary(ws, 26, .{xx length, key_package});
+}
+
+// Ready For Transition (23) and Invalid Commit Welcome (31) only carry the transition ID.
+ws_send_transition_op :: (ws: *Voice_Ws, op: s64, transition_id: u16) -> bool {
+    w: Json_Writer;
+    jw_init(*w);
+    jw_object(*w);
+        jw_key(*w, "op"); jw_int(*w, op);
+        jw_key(*w, "d");
+        jw_object(*w);
+            jw_key(*w, "transition_id"); jw_int(*w, transition_id);
+        jw_pop(*w);
+    jw_pop(*w);
+
+    if w.failed { print("Couldn't build op %\n", op); return false; }
+    print("-> %\n", jw_result(*w));
+    return ws_send_text(ws, jw_result(*w));
 }
 
 ws_send_text :: (ws: *Voice_Ws, text: string) -> bool {
@@ -674,6 +856,120 @@ ws_send_heartbeat :: (ws: *Voice_Ws) -> bool {
     now := current_time_monotonic();
     if ws.next_heartbeat < now  ws.next_heartbeat = now + interval;
     return true;
+}
+
+//
+// DAVE
+//
+// Everything here expects the caller to hold ws.dave_mutex.
+
+dave_lock :: (ws: *Voice_Ws) #expand {
+    lock(*ws.dave_mutex);
+    `defer unlock(*ws.dave_mutex);
+}
+
+dave_create :: (ws: *Voice_Ws) -> bool {
+    dave_lock(ws);
+    ws.dave = daveSessionCreate(null, null, on_mls_failure, null);
+    ws.dave_encryptor = daveEncryptorCreate();
+    if !ws.dave || !ws.dave_encryptor {
+        print("DAVE: couldn't create the session or the encryptor\n");
+        return false;
+    }
+    // Until the first transition executes, frames would go out without end-to-end encryption.
+    daveEncryptorSetPassthroughMode(ws.dave_encryptor, true);
+    return true;
+}
+
+dave_destroy :: (ws: *Voice_Ws) {
+    dave_lock(ws);
+    if ws.dave_encryptor  daveEncryptorDestroy(ws.dave_encryptor);
+    if ws.dave            daveSessionDestroy(ws.dave);
+    ws.dave_encryptor = null;
+    ws.dave = null;
+}
+
+self_user_id_c :: () -> *u8 {
+    return temp_c_string(tprint("%", bot_user_id));
+}
+
+// After Session Description (op 4), and again after a failed commit.
+dave_protocol_init :: (ws: *Voice_Ws, version: u16) -> bool {
+    if version > 0 {
+        dave_prepare_epoch(ws, DAVE_NEW_GROUP_EPOCH, version);
+        return ws_send_key_package(ws);
+    }
+
+    dave_prepare_transition(ws, DAVE_INIT_TRANSITION_ID, 0);
+    return true;
+}
+
+dave_prepare_epoch :: (ws: *Voice_Ws, epoch: s64, version: u16) {
+    print("DAVE: prepare epoch % (protocol version %)\n", epoch, version);
+    if epoch == DAVE_NEW_GROUP_EPOCH  daveSessionInit(ws.dave, version, ws.channel_id, self_user_id_c());
+}
+
+dave_prepare_transition :: (ws: *Voice_Ws, transition_id: u16, version: u16) {
+    print("DAVE: prepare transition % to protocol version %\n", transition_id, version);
+
+    if transition_id == DAVE_INIT_TRANSITION_ID {
+        dave_use_version(ws, version);
+        return;
+    }
+
+    for ws.dave_pending_transitions  if it.id == transition_id  remove it;
+    array_add(*ws.dave_pending_transitions, .{transition_id, version});
+}
+
+dave_execute_transition :: (ws: *Voice_Ws, transition_id: u16) {
+    for ws.dave_pending_transitions {
+        if it.id != transition_id  continue;
+        version := it.protocol_version;
+        remove it;
+
+        print("DAVE: execute transition % to protocol version %\n", transition_id, version);
+        if version == 0  daveSessionReset(ws.dave);
+        dave_use_version(ws, version);
+        return;
+    }
+
+    print("DAVE: execute for transition %, which wasn't prepared\n", transition_id);
+}
+
+// Points our encryptor at our own key ratchet, or at passthrough for version 0.
+dave_use_version :: (ws: *Voice_Ws, version: u16) {
+    if version == 0 {
+        daveEncryptorSetPassthroughMode(ws.dave_encryptor, true);
+        ws.dave_active_version = 0;
+        print("DAVE: sending without end-to-end encryption\n");
+        return;
+    }
+
+    ratchet := daveSessionGetKeyRatchet(ws.dave, self_user_id_c());
+    if !ratchet {
+        print("DAVE: no key ratchet for us at protocol version %\n", version);
+        return;
+    }
+    daveEncryptorSetKeyRatchet(ws.dave_encryptor, ratchet);  // the encryptor keeps its own copy
+    daveKeyRatchetDestroy(ratchet);
+    daveEncryptorSetPassthroughMode(ws.dave_encryptor, false);
+    ws.dave_active_version = version;
+    print("DAVE: sending with end-to-end encryption, protocol version %\n", version);
+}
+
+on_mls_failure :: (source: *u8, reason: *u8, user_data: *void) #c_call {
+    new_context: Context;
+    push_context new_context {
+        print("DAVE: MLS failure in %: %\n", to_string(source), to_string(reason));
+    }
+}
+
+on_dave_log :: (severity: DAVE_Logging_Severity, file: *u8, line: s32, message: *u8) #c_call {
+    if severity < .INFO  return;
+    new_context: Context;
+    push_context new_context {
+        print("[libdave %] %:% %\n", severity, path_filename(to_string(file)), line, to_string(message));
+    }
 }
 
 //

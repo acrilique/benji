@@ -1,10 +1,9 @@
 #import "BuildCpp";
+#import "Compiler";
+#import "Process";
 
-// Defines `discord`, the Concord library. It comes from #insert so the library exists before the compiler sees it.
+
 #insert -> string {
-    #import "Compiler";
-    #import "Process";
-
     for patch: string.["../patches/concord-null-channel.patch"] {
         applied := run_command("git", "apply", "--reverse", "--check", patch, working_directory = "vendor/concord", capture_and_return_output = true);
         if applied.exit_code == 0  continue;
@@ -21,6 +20,44 @@
     }
 
     return "discord :: #library,no_dll \"vendor/concord/lib/libdiscord\";";
+}
+
+#insert -> string {
+    #import "String";
+    #import "File_Utilities";
+    #import "System";
+
+    bootstrap_result := run_command("./vcpkg/bootstrap-vcpkg.sh", working_directory = "vendor/libdave/cpp");
+    if bootstrap_result.exit_code != 0 {
+        compiler_report("dave vcpkg bootstrap failed.");
+    }
+
+    make_result := run_command("make", "-j", working_directory = "vendor/libdave/cpp");
+    if make_result.exit_code != 0 {
+        compiler_report("\"make\" failed while building dave.");
+    }
+
+    gcc_result, gcc_output := run_command("c++", "-print-file-name=libstdc++.a", capture_and_return_output = true);
+    stdcpp_archive := trim(gcc_output);
+    if gcc_result.exit_code != 0 || !file_exists(stdcpp_archive) {
+        compiler_report("Couldn't find libstdc++.a with \"c++ -print-file-name\".");
+    }
+    gcc_dir := path_strip_filename(stdcpp_archive);
+
+    up: String_Builder;
+    for split(get_working_directory(), "/")  if it  append(*up, "../");
+    gcc_dir = tprint("%1%2", builder_to_string(*up), gcc_dir);
+
+    return tprint(#string DONE
+dave :: #library,no_dll "vendor/libdave/cpp/build/libdave";
+_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libmlspp";
+_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libhpke";
+_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libtls_syntax";
+_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libbytes";
+_ :: #library,system,link_always "libcrypto";
+_ :: #library,no_dll,link_always "%1libstdc++";
+_ :: #library,no_dll,link_always "%1libgcc_eh";
+DONE, gcc_dir);
 }
 
 #run {
