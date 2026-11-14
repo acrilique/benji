@@ -4,7 +4,7 @@
 
 // vcpkg builds the static libraries in deps/vcpkg.json (curl, OpenSSL, opus,
 // mlspp), then Concord compiles against that curl, then libdave against that OpenSSL and mlspp.
-// Build outputs go in .deps/. Declares `libcurl`, `opus`, `discord` and `dave`.
+// Build outputs go in .deps/.
 #insert -> string {
     #import "String";
     #import "File_Utilities";
@@ -79,7 +79,7 @@ _ :: #library,no_dll,link_always "%1libhpke";
 _ :: #library,no_dll,link_always "%1libtls_syntax";
 _ :: #library,no_dll,link_always "%1libbytes";
 _ :: #library,no_dll,link_always "%1libssl";
-_ :: #library,no_dll,link_always "%1libcrypto";
+libcrypto :: #library,no_dll,link_always "%1libcrypto";
 _ :: #library,no_dll,link_always "%1libz";
 _ :: #library,no_dll,link_always "%2libstdc++";
 _ :: #library,no_dll,link_always "%2libgcc_eh";

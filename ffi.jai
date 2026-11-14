@@ -4,7 +4,8 @@
 
 decoder :: #library,no_dll "decoder";
 _ :: #library,system,link_always "libm";
-// `libcurl`, `opus`, `discord` (Concord) and `dave` (libdave) are declared in build.jai, which builds them.
+// `libcurl`, `opus`, `discord` (Concord), `dave` (libdave) and `libcrypto`
+// (OpenSSL) are declared in build.jai, which builds them.
 
 //
 // Foreign bindings: decoder (decoder.c) and libopus
@@ -376,6 +377,25 @@ daveDecryptorTransitionToPassthroughMode :: (decryptor: DAVE_Decryptor, passthro
 daveDecryptorDecrypt :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, encrypted_frame: *u8, encrypted_frame_length: u64, frame: *u8, frame_capacity: u64, bytes_written: *u64) -> DAVE_Decryptor_Result #foreign dave;
 daveDecryptorGetMaxPlaintextByteSize :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, encrypted_frame_size: u64) -> u64 #foreign dave;
 daveDecryptorGetStats :: (decryptor: DAVE_Decryptor, media_type: DAVE_Media_Type, stats: *DAVE_Decryptor_Stats) -> void #foreign dave;
+
+//
+// Foreign bindings: OpenSSL's libcrypto, for the AES-256-GCM transport encryption
+//
+
+EVP_CIPHER_CTX :: void;
+EVP_CIPHER     :: void;
+
+EVP_CTRL_GCM_GET_TAG :: 0x10;
+
+EVP_CIPHER_CTX_new  :: () -> *EVP_CIPHER_CTX #foreign libcrypto;
+EVP_CIPHER_CTX_free :: (ctx: *EVP_CIPHER_CTX) -> void #foreign libcrypto;
+EVP_aes_256_gcm     :: () -> *EVP_CIPHER #foreign libcrypto;
+// All of these return 1 on success. `impl` is an ENGINE, always null here.
+EVP_EncryptInit_ex  :: (ctx: *EVP_CIPHER_CTX, cipher: *EVP_CIPHER, impl: *void, key: *u8, iv: *u8) -> s32 #foreign libcrypto;
+// With `out` null, `in` is additional authenticated data.
+EVP_EncryptUpdate   :: (ctx: *EVP_CIPHER_CTX, out: *u8, outl: *s32, in: *u8, inl: s32) -> s32 #foreign libcrypto;
+EVP_EncryptFinal_ex :: (ctx: *EVP_CIPHER_CTX, out: *u8, outl: *s32) -> s32 #foreign libcrypto;
+EVP_CIPHER_CTX_ctrl :: (ctx: *EVP_CIPHER_CTX, type: s32, arg: s32, ptr: *void) -> s32 #foreign libcrypto;
 
 //
 // Foreign bindings: libcurl, for the voice WebSocket

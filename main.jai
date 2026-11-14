@@ -21,12 +21,23 @@ TOKENFILE :: "bot-key";
 OPUS_APPLICATION_AUDIO :: 2049;
 FRAME_SIZE :: 960;
 
-VOICE_MODE :: "aead_xchacha20_poly1305_rtpsize";
+VOICE_MODE :: "aead_aes256_gcm_rtpsize";
 IP_DISCOVERY_ATTEMPTS   :: 3;
 IP_DISCOVERY_TIMEOUT_MS :: 1000;
 
 DAVE_INIT_TRANSITION_ID :: 0;
 DAVE_NEW_GROUP_EPOCH    :: 1;
+
+FRAME_MS            :: 20;
+OPUS_MAX_PACKET     :: 1500;
+DAVE_FRAME_CAPACITY :: 2048;
+RTP_HEADER_SIZE     :: 12;
+RTP_PAYLOAD_TYPE    :: 0x78;
+GCM_TAG_SIZE        :: 16;
+NONCE_SUFFIX_SIZE   :: 4;
+SILENCE_FRAME       :: u8.[0xF8, 0xFF, 0xFE];
+SILENCE_FRAME_COUNT :: 5;
+MAX_LAG_MS          :: 200;
 
 Args :: struct {
     music_folder: string;
@@ -83,7 +94,7 @@ voice: Voice_Connection;
 Voice_Ws :: struct {
     endpoint, session_id, token: string;
     guild_id: u64;
-    channel_id: u64;  // also the DAVE group ID
+    channel_id: u64;
 
     stop_requested: bool;
 
@@ -111,6 +122,16 @@ Voice_Ws :: struct {
     dave_encryptor: DAVE_Encryptor;
     dave_pending_transitions: [..]Dave_Transition;
     dave_active_version: u16;
+
+    cipher: *EVP_CIPHER_CTX;
+
+    audio_thread: Thread;
+    audio_started: bool;
+    audio_stop: bool;
+
+    rtp_sequence: u16;
+    rtp_timestamp: u32;
+    transport_nonce: u32;
 }
 
 Dave_Transition :: struct {
@@ -395,8 +416,10 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
     if !ws_connect(ws) return 1;
     defer curl_easy_cleanup(ws.curl);
     defer close_and_reset(*ws.udp);
+    defer transport_destroy(ws);
     if !dave_create(ws)  return 1;
     defer dave_destroy(ws);
+    defer audio_stop_and_join(ws);
 
     gotta_stop: bool;
 
@@ -407,6 +430,11 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
         if !ws_drain(ws) break;
         if ws.heartbeat_interval_ms > 0 && current_time_monotonic() >= ws.next_heartbeat
             if !ws_send_heartbeat(ws)  break;
+
+        if !ws.audio_started && audio_ready(ws) {
+            if !ws_send_speaking(ws, 1)  break;
+            audio_start(ws);
+        }
 
         gotta_stop = atomic_read(*ws.stop_requested);
     }
@@ -531,7 +559,7 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
     d := json_find(root, msg, "d");
 
     // These get a one-line summary. Op 4 holds the secret key, so it must not be logged as is.
-    quiet := op == 4 || op == 6 || op == 11 || op == 13 || op == 18 || op == 20;
+    quiet := op == 4 || op == 6 || op == 11 || op == 13 || op == 15 || op == 18 || op == 20;
     if !quiet  print("<- %\n", msg);
 
     if op == {
@@ -569,13 +597,14 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
             ws.ip   = copy_string(json_text(ip, msg));
             ws.port = xx string_to_int(json_text(port, msg));
 
-            has_xchacha := false;
+            offered := false;
             for 0..modes.size-1 {
                 mode := json_text(*modes.fields[it], msg);
-                if mode == VOICE_MODE  has_xchacha = true;
+                if mode == VOICE_MODE  offered = true;
             }
-            print("Ready: ssrc=% udp=%:% xchacha=%\n", ws.ssrc, ws.ip, ws.port, has_xchacha);
-            if !has_xchacha {
+            print("Ready: ssrc=% udp=%:% %=%\n", ws.ssrc, ws.ip, ws.port, VOICE_MODE, offered);
+            if !offered {
+                // XChaCha20-Poly1305 is the fallback to add if this ever happens.
                 print("The voice server doesn't offer %\n", VOICE_MODE);
                 return false;
             }
@@ -589,6 +618,11 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
             if !udp_discover_ip(ws)  return false;
             if !ws_send_select_protocol(ws)  return false;
         case 4; // Session Description
+            if ws.audio_started {
+                print("<- Session Description again while sending audio, ignoring it\n");
+                return true;
+            }
+
             mode := json_find(d, msg, "mode");
             key  := json_find(d, msg, "secret_key");
             dave := json_find(d, msg, "dave_protocol_version");
@@ -604,9 +638,11 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
 
             for 0..key.size-1  ws.secret_key[it] = xx string_to_int(json_text(*key.fields[it], msg));
             ws.dave_protocol_version = ifx dave then cast(s32) string_to_int(json_text(dave, msg)) else 0;
-            ws.have_session_description = true;
             print("<- Session Description: mode=% dave_protocol_version=% secret_key=(% bytes)\n",
                 json_text(mode, msg), ws.dave_protocol_version, ws.secret_key.count);
+
+            if !transport_init(ws)  return false;
+            ws.have_session_description = true;
 
             dave_lock(ws);
             if !dave_protocol_init(ws, xx ws.dave_protocol_version)  return false;
@@ -633,6 +669,7 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
                 daveSessionRemoveRecognizedUser(ws.dave, temp_c_string(text));
             }
             print("<- Client Disconnect: %, % in the call\n", id, ws.users_in_call.count);
+        case 15; // Media Sink Wants: only matters for video
         case 18; // Client Flags
         case 20; // Client Platform
         case 21; // DAVE Prepare Transition
@@ -829,6 +866,24 @@ ws_send_select_protocol :: (ws: *Voice_Ws) -> bool {
     jw_pop(*w);
 
     if w.failed { print("Couldn't build Select Protocol\n"); return false; }
+    print("-> %\n", jw_result(*w));
+    return ws_send_text(ws, jw_result(*w));
+}
+
+ws_send_speaking :: (ws: *Voice_Ws, speaking: s64) -> bool {
+    w: Json_Writer;
+    jw_init(*w);
+    jw_object(*w);
+        jw_key(*w, "op"); jw_int(*w, 5);
+        jw_key(*w, "d");
+        jw_object(*w);
+            jw_key(*w, "speaking"); jw_int(*w, speaking);
+            jw_key(*w, "delay");    jw_int(*w, 0);
+            jw_key(*w, "ssrc");     jw_int(*w, ws.ssrc);
+        jw_pop(*w);
+    jw_pop(*w);
+
+    if w.failed { print("Couldn't build Speaking\n"); return false; }
     print("-> %\n", jw_result(*w));
     return ws_send_text(ws, jw_result(*w));
 }
@@ -1099,77 +1154,212 @@ jw_int :: (w: *Json_Writer, n: s64) {
 jw_result :: (w: *Json_Writer) -> string { return string.{xx w.b.pos, w.buf.data}; }
 
 //
+// Transport encryption (aead_aes256_gcm_rtpsize)
+//
+
+transport_init :: (ws: *Voice_Ws) -> bool {
+    transport_destroy(ws);
+    ws.cipher = EVP_CIPHER_CTX_new();
+    if !ws.cipher {
+        print("Couldn't create the AES-256-GCM context\n");
+        return false;
+    }
+    if EVP_EncryptInit_ex(ws.cipher, EVP_aes_256_gcm(), null, ws.secret_key.data, null) != 1 {
+        print("Couldn't load the transport key\n");
+        transport_destroy(ws);
+        return false;
+    }
+    return true;
+}
+
+transport_destroy :: (ws: *Voice_Ws) {
+    if ws.cipher  EVP_CIPHER_CTX_free(ws.cipher);
+    ws.cipher = null;
+}
+
+transport_encrypt :: (ctx: *EVP_CIPHER_CTX, nonce: u32, aad: []u8, plaintext: []u8, out: *u8) -> bool {
+    iv: [12]u8;
+    put_u32_be(iv.data, nonce);
+    if EVP_EncryptInit_ex(ctx, null, null, null, iv.data) != 1  return false;
+
+    length: s32;
+    if EVP_EncryptUpdate(ctx, null, *length, aad.data, xx aad.count) != 1  return false;
+    if EVP_EncryptUpdate(ctx, out, *length, plaintext.data, xx plaintext.count) != 1  return false;
+    written := length;
+    if EVP_EncryptFinal_ex(ctx, out + written, *length) != 1  return false;
+    written += length;
+    if written != plaintext.count  return false;
+
+    return EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_SIZE, out + written) == 1;
+}
+
+//
 // Audio
 //
 
-decode_and_opus_encode :: () {
-    buffer: [2 * FRAME_SIZE]s16;
-    encoded_buf: [4000]u8;
-    opus_err: s32;
+audio_ready :: (ws: *Voice_Ws) -> bool {
+    if !ws.have_session_description || !ws.cipher  return false;
+    return ws.dave_protocol_version == 0 || ws.dave_active_version > 0;
+}
 
-    outfile, s := file_open("output",
-        for_writing = true,
-        keep_existing_content = false);
-    if !s {
-        print("Failed to open file for writing.\n");
+audio_start :: (ws: *Voice_Ws) {
+    ws.audio_started = true;
+    atomic_write(*ws.audio_stop, false);
+    if !thread_init(*ws.audio_thread, audio_thread_proc) {
+        print("Failed to create the audio thread\n");
         return;
     }
-    defer file_close(*outfile);
+    ws.audio_thread.data = ws;
+    thread_start(*ws.audio_thread);
+}
 
-    path := to_c_string(TESTFILE);
-    defer free(path);
+audio_stop_and_join :: (ws: *Voice_Ws) {
+    if !ws.audio_started || !ws.audio_thread.data  return;
+    atomic_write(*ws.audio_stop, true);
+    thread_is_done(*ws.audio_thread, -1);
+    thread_deinit(*ws.audio_thread);
+    ws.audio_thread = .{};
+}
 
-    dec := decoder_open(path);
+audio_thread_proc :: (thread: *Thread) -> s64 {
+    ws := cast(*Voice_Ws) thread.data;
+    play_file(ws, TESTFILE);
+    return 0;
+}
+
+Audio_Stats :: struct {
+    sent: s64;
+    failed: s64;
+}
+
+play_file :: (ws: *Voice_Ws, path: string) {
+    c_path := to_c_string(path);
+    defer free(c_path);
+
+    dec := decoder_open(c_path);
     if !dec {
-        print("Failed to create miniaudio decoder.\n");
+        print("Audio: couldn't open %\n", path);
         return;
     }
     defer decoder_close(dec);
 
+    opus_err: s32;
     opus_enc := opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, *opus_err);
     if !opus_enc {
-        print("Failed to create opus encoder: %\n", to_string(opus_strerror(opus_err)));
+        print("Audio: couldn't create the Opus encoder: %\n", to_string(opus_strerror(opus_err)));
         return;
     }
     defer opus_encoder_destroy(opus_enc);
 
-    opus_dec := opus_decoder_create(48000, 2, *opus_err);
-    if !opus_dec {
-        print("Failed to create opus decoder: %\n", to_string(opus_strerror(opus_err)));
-        return;
+    print("Audio: playing %\n", path);
+
+    pcm: [2 * FRAME_SIZE]s16;
+    opus: [OPUS_MAX_PACKET]u8;
+    stats: Audio_Stats;
+    frame_duration := milliseconds_to_apollo(FRAME_MS);
+    next_frame := current_time_monotonic();
+    stopped := false;
+
+    while true {
+        reset_temporary_storage();
+        if atomic_read(*ws.audio_stop) { stopped = true; break; }
+
+        frames_read := decoder_read(dec, pcm.data, FRAME_SIZE);
+        if frames_read < 0 {
+            print("Audio: decoding % failed\n", path);
+            break;
+        }
+        if frames_read == 0  break;
+        if frames_read < FRAME_SIZE
+            memset(pcm.data + 2 * frames_read, 0, (2 * FRAME_SIZE - 2 * frames_read) * size_of(s16));
+
+        bytes := opus_encode(opus_enc, pcm.data, FRAME_SIZE, opus.data, opus.count);
+        if bytes < 0 {
+            print("Audio: Opus encoding failed: %\n", to_string(opus_strerror(bytes)));
+            break;
+        }
+
+        send_frame_on_schedule(ws, .{xx bytes, opus.data}, *next_frame, frame_duration, *stats);
+        if frames_read < FRAME_SIZE  break;
     }
-    defer opus_decoder_destroy(opus_dec);
 
-    while (true) {
-        frames_read := decoder_read(dec, buffer.data, FRAME_SIZE);
-        if frames_read < FRAME_SIZE {
-            if frames_read == -1 {
-                print("Failed to decode test file\n");
-                break;
-            }
-            memset(buffer.data + 2 * frames_read, 0,
-                (2 * FRAME_SIZE - 2 * frames_read) * size_of(s16));
+    if !stopped {
+        for 1..SILENCE_FRAME_COUNT {
+            if atomic_read(*ws.audio_stop) { stopped = true; break; }
+            send_frame_on_schedule(ws, SILENCE_FRAME, *next_frame, frame_duration, *stats);
         }
+    }
 
-        bytes_encoded := opus_encode(opus_enc, buffer.data,
-            FRAME_SIZE, encoded_buf.data, encoded_buf.count);
-        if bytes_encoded < 0 {
-            print("Failed to encode opus frame: %\n", to_string(opus_strerror(bytes_encoded)));
-            break;
-        }
+    print("Audio: % % (% frames sent, % failed)\n", ifx stopped then "stopped" else "finished", path, stats.sent, stats.failed);
+}
 
-        frames_decoded := opus_decode(opus_dec, encoded_buf.data,
-            bytes_encoded, buffer.data, FRAME_SIZE, 0);
-        if frames_decoded < 0 {
-            print("Failed to decode opus frame: %\n", to_string(opus_strerror(frames_decoded)));
-            break;
-        }
+send_frame_on_schedule :: (ws: *Voice_Ws, opus: []u8, next_frame: *Apollo_Time, frame_duration: Apollo_Time, stats: *Audio_Stats) {
+    packet: [RTP_HEADER_SIZE + DAVE_FRAME_CAPACITY + GCM_TAG_SIZE + NONCE_SUFFIX_SIZE]u8;
+    length, error := build_packet(ws, opus, packet);
 
-        if !file_write(*outfile, buffer.data, frames_decoded * 2 * size_of(s16)) {
-            print("Failed to write to disk\n");
-            break;
-        }
+    wait_until(<<next_frame);
 
-        if frames_read < FRAME_SIZE break;
+    if !error {
+        sent := send(ws.udp, packet.data, xx length, 0);
+        if sent != length  error = tprint("UDP send failed (%)", errno());
+    }
+
+    if error {
+        // Only every 250th failure (5 s of audio), so a lasting problem doesn't flood the log.
+        if stats.failed % 250 == 0  print("Audio: % (% failed so far)\n", error, stats.failed + 1);
+        stats.failed += 1;
+    } else {
+        stats.sent += 1;
+    }
+
+    ws.rtp_sequence  += 1;
+    ws.rtp_timestamp += FRAME_SIZE;
+
+    <<next_frame += frame_duration;
+    now := current_time_monotonic();
+    if now - <<next_frame > milliseconds_to_apollo(MAX_LAG_MS) {
+        print("Audio: % ms behind, restarting the schedule\n", to_milliseconds(now - <<next_frame));
+        <<next_frame = now;
+    }
+}
+
+build_packet :: (ws: *Voice_Ws, opus: []u8, packet: []u8) -> length: s64, error: string {
+    header     := packet.data;
+    ciphertext := packet.data + RTP_HEADER_SIZE;
+
+    dave_frame: [DAVE_FRAME_CAPACITY]u8;
+    dave_length: u64;
+    {
+        dave_lock(ws);
+        needed := daveEncryptorGetMaxCiphertextByteSize(ws.dave_encryptor, .AUDIO, xx opus.count);
+        if needed > dave_frame.count
+            return 0, tprint("DAVE needs % bytes for a % byte frame", needed, opus.count);
+        result := daveEncryptorEncrypt(ws.dave_encryptor, .AUDIO, ws.ssrc, opus.data, xx opus.count,
+            dave_frame.data, dave_frame.count, *dave_length);
+        if result != .SUCCESS  return 0, tprint("DAVE encryption failed: %", result);
+    }
+
+    header[0] = 0x80;
+    header[1] = RTP_PAYLOAD_TYPE;
+    put_u16_be(header + 2, ws.rtp_sequence);
+    put_u32_be(header + 4, ws.rtp_timestamp);
+    put_u32_be(header + 8, ws.ssrc);
+
+    nonce := ws.transport_nonce;
+    ws.transport_nonce += 1;
+
+    plaintext := []u8.{xx dave_length, dave_frame.data};
+    if !transport_encrypt(ws.cipher, nonce, .{RTP_HEADER_SIZE, header}, plaintext, ciphertext)
+        return 0, "transport encryption failed";
+    put_u32_be(ciphertext + plaintext.count + GCM_TAG_SIZE, nonce);
+
+    return RTP_HEADER_SIZE + plaintext.count + GCM_TAG_SIZE + NONCE_SUFFIX_SIZE, "";
+}
+
+wait_until :: (deadline: Apollo_Time) {
+    while true {
+        remaining := to_microseconds(deadline - current_time_monotonic());
+        if remaining <= 0  return;
+        sleep_milliseconds(xx ((remaining + 999) / 1000));
     }
 }
