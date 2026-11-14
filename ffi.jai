@@ -3,10 +3,8 @@
 //
 
 decoder :: #library,no_dll "decoder";
-opus :: #library,system "libopus";
 _ :: #library,system,link_always "libm";
-libcurl :: #library,system,link_always "libcurl";
-// `discord` (Concord) and `dave` (libdave and its dependencies) are declared in build.jai, after make builds them.
+// `libcurl`, `opus`, `discord` (Concord) and `dave` (libdave) are declared in build.jai, which builds them.
 
 //
 // Foreign bindings: decoder (decoder.c) and libopus

@@ -2,40 +2,61 @@
 #import "Compiler";
 #import "Process";
 
-
-#insert -> string {
-    for patch: string.["../patches/concord-null-channel.patch"] {
-        applied := run_command("git", "apply", "--reverse", "--check", patch, working_directory = "vendor/concord", capture_and_return_output = true);
-        if applied.exit_code == 0  continue;
-
-        apply := run_command("git", "apply", patch, working_directory = "vendor/concord");
-        if apply.exit_code != 0 {
-            compiler_report(tprint("Failed to apply % to concord.", patch));
-        }
-    }
-
-    result := run_command("make", "-j", working_directory = "vendor/concord");
-    if result.exit_code != 0 {
-        compiler_report("\"make\" failed while building concord.");
-    }
-
-    return "discord :: #library,no_dll \"vendor/concord/lib/libdiscord\";";
-}
-
+// vcpkg builds the static libraries in deps/vcpkg.json (curl, OpenSSL, opus,
+// mlspp), then Concord compiles against that curl, then libdave against that OpenSSL and mlspp.
+// Build outputs go in .deps/. Declares `libcurl`, `opus`, `discord` and `dave`.
 #insert -> string {
     #import "String";
     #import "File_Utilities";
     #import "System";
 
-    bootstrap_result := run_command("./vcpkg/bootstrap-vcpkg.sh", working_directory = "vendor/libdave/cpp");
-    if bootstrap_result.exit_code != 0 {
-        compiler_report("dave vcpkg bootstrap failed.");
+    root := get_working_directory();
+
+    VCPKG_DIR :: "vendor/libdave/cpp/vcpkg";
+    VCPKG_EXE :: #ifx OS == .WINDOWS then "vcpkg.exe" else "vcpkg";
+
+    #if OS == .LINUX && CPU == .X64        TRIPLET :: "x64-linux";
+    else #if OS == .MACOS && CPU == .ARM64 TRIPLET :: "arm64-osx";
+    else #if OS == .MACOS                  TRIPLET :: "x64-osx";
+    else #if OS == .WINDOWS                TRIPLET :: "x64-windows-static";
+    else #assert false, "No vcpkg triplet for this platform.";
+
+    installed := tprint("%/.deps/vcpkg_installed", root);
+    lib := tprint(".deps/vcpkg_installed/%/lib/", TRIPLET);
+
+    run :: (what: string, args: .. string, working_directory := "") {
+        result := run_command(.. args, working_directory = working_directory);
+        if result.exit_code != 0  compiler_report(tprint("Building % failed.", what));
     }
 
-    make_result := run_command("make", "-j", working_directory = "vendor/libdave/cpp");
-    if make_result.exit_code != 0 {
-        compiler_report("\"make\" failed while building dave.");
+    if !file_exists(tprint("%/%", VCPKG_DIR, VCPKG_EXE)) {
+        #if OS == .WINDOWS  run("vcpkg", "cmd", "/c", "bootstrap-vcpkg.bat", "-disableMetrics", working_directory = VCPKG_DIR);
+        else                run("vcpkg", "./bootstrap-vcpkg.sh", "-disableMetrics", working_directory = VCPKG_DIR);
     }
+
+    run("the vcpkg dependencies", tprint("%/%/%", root, VCPKG_DIR, VCPKG_EXE), "install",
+        "--x-manifest-root=deps", tprint("--x-install-root=%", installed), tprint("--triplet=%", TRIPLET), "--disable-metrics");
+
+    for patch: string.["../patches/concord-null-channel.patch"] {
+        applied := run_command("git", "apply", "--reverse", "--check", patch, working_directory = "vendor/concord", capture_and_return_output = true);
+        if applied.exit_code == 0  continue;
+        run(tprint("concord (applying %)", patch), "git", "apply", patch, working_directory = "vendor/concord");
+    }
+
+    run("concord", "env", tprint("CFLAGS=-O2 -I%/%/include", installed, TRIPLET), "make", "-j", working_directory = "vendor/concord");
+
+    if !file_exists(".deps/libdave/CMakeCache.txt") {
+        run("libdave (configure)", "cmake", "-S", "vendor/libdave/cpp", "-B", ".deps/libdave",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DTESTING=OFF",
+            tprint("-DCMAKE_TOOLCHAIN_FILE=%/%/scripts/buildsystems/vcpkg.cmake", root, VCPKG_DIR),
+            tprint("-DVCPKG_TARGET_TRIPLET=%", TRIPLET),
+            tprint("-DVCPKG_MANIFEST_DIR=%/deps", root),
+            tprint("-DVCPKG_INSTALLED_DIR=%", installed),
+            "-DVCPKG_MANIFEST_INSTALL=OFF");
+    }
+    run("libdave", "cmake", "--build", ".deps/libdave", "--target", "libdave", "--config", "Release", "-j");
 
     gcc_result, gcc_output := run_command("c++", "-print-file-name=libstdc++.a", capture_and_return_output = true);
     stdcpp_archive := trim(gcc_output);
@@ -45,19 +66,25 @@
     gcc_dir := path_strip_filename(stdcpp_archive);
 
     up: String_Builder;
-    for split(get_working_directory(), "/")  if it  append(*up, "../");
+    for split(root, "/")  if it  append(*up, "../");
     gcc_dir = tprint("%1%2", builder_to_string(*up), gcc_dir);
 
     return tprint(#string DONE
-dave :: #library,no_dll "vendor/libdave/cpp/build/libdave";
-_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libmlspp";
-_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libhpke";
-_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libtls_syntax";
-_ :: #library,no_dll,link_always "vendor/libdave/cpp/build/vcpkg_installed/x64-linux/lib/libbytes";
-_ :: #library,system,link_always "libcrypto";
-_ :: #library,no_dll,link_always "%1libstdc++";
-_ :: #library,no_dll,link_always "%1libgcc_eh";
-DONE, gcc_dir);
+libcurl :: #library,no_dll,link_always "%1libcurl";
+opus    :: #library,no_dll "%1libopus";
+discord :: #library,no_dll "vendor/concord/lib/libdiscord";
+dave    :: #library,no_dll ".deps/libdave/libdave";
+_ :: #library,no_dll,link_always "%1libmlspp";
+_ :: #library,no_dll,link_always "%1libhpke";
+_ :: #library,no_dll,link_always "%1libtls_syntax";
+_ :: #library,no_dll,link_always "%1libbytes";
+_ :: #library,no_dll,link_always "%1libssl";
+_ :: #library,no_dll,link_always "%1libcrypto";
+_ :: #library,no_dll,link_always "%1libz";
+_ :: #library,no_dll,link_always "%2libstdc++";
+_ :: #library,no_dll,link_always "%2libgcc_eh";
+_ :: #library,no_dll,link_always "%2libgcc";
+DONE, lib, gcc_dir);
 }
 
 #run {

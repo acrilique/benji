@@ -1,0 +1,22 @@
+{
+  "name": "audio-player-discord-bot",
+  "description": "Native libraries linked by the bot, built statically by vcpkg so there is exactly one OpenSSL.",
+  "dependencies": [
+    "openssl",
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": ["openssl", "websockets"]
+    },
+    "opus",
+    "nlohmann-json",
+    {
+      "name": "mlspp",
+      "features": ["openssl"]
+    }
+  ],
+  "builtin-baseline": "16c71a39e5a0fc0bdb3fad03beef8f38ee00ee3b",
+  "vcpkg-configuration": {
+    "overlay-ports": ["../vendor/libdave/cpp/vcpkg-alts/overlay-ports"]
+  }
+}
