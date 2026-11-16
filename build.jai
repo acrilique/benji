@@ -3,7 +3,7 @@
 #import "Process";
 
 // vcpkg builds the static libraries in deps/vcpkg.json (curl, OpenSSL, opus,
-// mlspp), then Concord compiles against that curl, then libdave against that OpenSSL and mlspp.
+// mlspp), then libdave compiles against that OpenSSL and mlspp.
 // Build outputs go in .deps/.
 #insert -> string {
     #import "String";
@@ -37,14 +37,6 @@
     run("the vcpkg dependencies", tprint("%/%/%", root, VCPKG_DIR, VCPKG_EXE), "install",
         "--x-manifest-root=deps", tprint("--x-install-root=%", installed), tprint("--triplet=%", TRIPLET), "--disable-metrics");
 
-    for patch: string.["../patches/concord-null-channel.patch"] {
-        applied := run_command("git", "apply", "--reverse", "--check", patch, working_directory = "vendor/concord", capture_and_return_output = true);
-        if applied.exit_code == 0  continue;
-        run(tprint("concord (applying %)", patch), "git", "apply", patch, working_directory = "vendor/concord");
-    }
-
-    run("concord", "env", tprint("CFLAGS=-O2 -I%/%/include", installed, TRIPLET), "make", "-j", working_directory = "vendor/concord");
-
     if !file_exists(".deps/libdave/CMakeCache.txt") {
         run("libdave (configure)", "cmake", "-S", "vendor/libdave/cpp", "-B", ".deps/libdave",
             "-DCMAKE_BUILD_TYPE=Release",
@@ -72,7 +64,6 @@
     return tprint(#string DONE
 libcurl :: #library,no_dll,link_always "%1libcurl";
 opus    :: #library,no_dll "%1libopus";
-discord :: #library,no_dll "vendor/concord/lib/libdiscord";
 dave    :: #library,no_dll ".deps/libdave/libdave";
 _ :: #library,no_dll,link_always "%1libmlspp";
 _ :: #library,no_dll,link_always "%1libhpke";
@@ -90,14 +81,18 @@ DONE, lib, gcc_dir);
 #run {
     #import "File_Utilities";
 
-    // Compiling miniaudio takes ~11s, so only rebuild decoder.a when its sources changed.
-    lib_time, _, lib_exists := file_modtime_and_size("decoder.a");
-    needs_rebuild := !lib_exists;
-    for source: string.["decoder.c", "vendor/miniaudio/miniaudio.h"] {
-        if needs_rebuild break;
-        source_time := file_modtime_and_size(source);
-        if source_time > lib_time  needs_rebuild = true;
+    // Compiling miniaudio takes ~11s, so only rebuild a library when its sources changed.
+    build_if_changed :: (name: string, sources: .. string) {
+        lib_time, _, lib_exists := file_modtime_and_size(tprint("%.a", name));
+        needs_rebuild := !lib_exists;
+        for sources {
+            if needs_rebuild break;
+            source_time := file_modtime_and_size(it);
+            if source_time > lib_time  needs_rebuild = true;
+        }
+        if needs_rebuild  build_cpp_static_lib(name, sources[0]);
     }
 
-    if needs_rebuild  build_cpp_static_lib("decoder", "decoder.c");
+    build_if_changed("decoder", "decoder.c", "vendor/miniaudio/miniaudio.h");
+    build_if_changed("json", "json.c", "vendor/jsmn/jsmn.h", "vendor/jsmn/jsmn-find.h", "vendor/jsmn/chash.h");
 }

@@ -11,6 +11,7 @@
 
 #load "build.jai";
 #load "ffi.jai";
+#load "discord.jai";
 
 //
 // Constants
@@ -70,33 +71,19 @@ main :: () {
     init(*player.mutex, "player");
     init(*player.wake);
 
-    discord_context = context;
     daveSetLogSinkCallback(on_dave_log);
-    client := discord_init(to_c_string(token));
-    if !client {
-        print("Failed to initialize discord client\n");
+    if curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK {
+        print("Failed to initialize libcurl\n");
         return;
     }
-    defer discord_cleanup(client);
 
-    discord_add_intents(client, DISCORD_INTENT_GUILDS | DISCORD_INTENT_GUILD_VOICE_STATES);
-    discord_set_on_ready(client, on_ready);
-    discord_set_on_interaction_create(client, on_interaction_create);
-    discord_set_on_guild_create(client, on_guild_create);
-    discord_set_on_voice_state_update(client, on_voice_state_update);
-    discord_set_on_voice_server_update(client, on_voice_server_update);
-
-    err := discord_run(client);
-    print("Discord connection stopped: %\n", to_string(discord_strerror(err, client)));
+    reason := discord_run(trim(token), DISCORD_INTENT_GUILDS | DISCORD_INTENT_GUILD_VOICE_STATES);
+    print("Discord connection stopped: %\n", reason);
 }
 
 //
 // State
 //
-
-// Discord's callbacks run on the main thread, inside discord_run. They push this to get main's
-// temporary storage, and reset it on entry: nothing temporary outlives a callback.
-discord_context: Context;
 
 bot_user_id: u64;
 music_folder: string;
@@ -193,85 +180,78 @@ voice_ws_running: bool;
 // Discord event handlers
 //
 
-on_ready :: (client: *void, event: *Discord_Ready) #c_call {
-    push_context discord_context {
-        reset_temporary_storage();
-        print("Discord is ready\n");
-        print("User id is: %\n", event.user.id);
-        bot_user_id = event.user.id;
-        register_commands(client, event.application.id);
-    }
-}
+// Called on the main thread, inside discord_run, for every gateway dispatch. Temporary storage
+// is reset before each one: nothing temporary outlives a handler.
+on_discord_event :: (name: string, d: *Jsmnf_Pair, js: string) {
+    if name == {
+        case "READY";
+            bot_user_id = json_id(json_find(d, js, "user"), js, "id");
+            print("Discord is ready\n");
+            print("User id is: %\n", bot_user_id);
+            register_commands(json_id(json_find(d, js, "application"), js, "id"));
 
-on_interaction_create :: (client: *void, event: *Discord_Interaction) #c_call {
-    push_context discord_context {
-        reset_temporary_storage();
-        if !event.data  return;
-        if event.type == DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE {
-            send_file_suggestions(client, event);
-            return;
-        }
-        if event.type != DISCORD_INTERACTION_APPLICATION_COMMAND  return;
+        case "INTERACTION_CREATE";
+            interaction, ok := decode_interaction(d, js);
+            if !ok  return;
+            if interaction.type == DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE {
+                send_file_suggestions(*interaction);
+            } else if interaction.type == DISCORD_INTERACTION_APPLICATION_COMMAND {
+                send_reply(*interaction, command_handle(*interaction));
+            }
 
-        send_reply(client, event, command_handle(client, event));
-    }
-}
+        case "GUILD_CREATE";
+            guild_id := json_id(d, js, "id");
+            for voice_states  if it.guild_id == guild_id  remove it;
 
-on_guild_create :: (client: *void, event: *Discord_Guild) #c_call {
-    push_context discord_context {
-        reset_temporary_storage();
-        for voice_states  if it.guild_id == event.id  remove it;
+            // These lack `guild_id`.
+            states := json_find(d, js, "voice_states");
+            if !states || states.type != JSMN_ARRAY  return;
+            for 0..states.size - 1 {
+                state := *states.fields[it];
+                remember_voice_state(guild_id, json_id(state, js, "user_id"), json_id(state, js, "channel_id"));
+            }
 
-        if !event.voice_states  return;
-        for 0..event.voice_states.size - 1 {
-            state := *event.voice_states.array[it];
-            remember_voice_state(event.id, state.user_id, state.channel_id);
-        }
-    }
-}
+        case "VOICE_STATE_UPDATE";
+            guild_id   := json_id(d, js, "guild_id");
+            user_id    := json_id(d, js, "user_id");
+            channel_id := json_id(d, js, "channel_id");
+            remember_voice_state(guild_id, user_id, channel_id);
 
-on_voice_state_update :: (client: *void, event: *Discord_Voice_State) #c_call {
-    push_context discord_context {
-        reset_temporary_storage();
-        remember_voice_state(event.guild_id, event.user_id, event.channel_id);
+            if user_id != bot_user_id || guild_id != voice.guild_id  return;
 
-        if event.user_id != bot_user_id ||
-            event.guild_id != voice.guild_id return;
+            if channel_id == 0 {
+                reset_voice();
+                return;
+            }
 
-        if event.channel_id == 0 {
-            reset_voice();
-            return;
-        }
+            voice.channel_id = channel_id;
+            if !copy_c_string(*voice.session_id, json_string(d, js, "session_id"), "session id")  return;
+            if voice.token[0] && !voice_ws_running  start_voice_ws();
 
-        voice.channel_id = event.channel_id;
-        if !copy_c_string(*voice.session_id, event.session_id, "session id")  return;
-        if voice.token[0] && !voice_ws_running  start_voice_ws();
-    }
-}
+        case "VOICE_SERVER_UPDATE";
+            if json_id(d, js, "guild_id") != voice.guild_id  return;
 
-on_voice_server_update :: (client: *void, event: *Discord_Voice_Server_Update) #c_call {
-    push_context discord_context {
-        reset_temporary_storage();
-        if event.guild_id != voice.guild_id return;
-        if !event.endpoint || !copy_c_string(*voice.endpoint, event.endpoint, "endpoint")
-                           || !copy_c_string(*voice.token, event.token, "token") {
-            stop_voice_ws();
-            voice.token[0] = 0;
-            return;
-        }
-        if voice.session_id[0]  start_voice_ws();
+            // A null endpoint means the voice server went away, and another update follows.
+            endpoint := json_string(d, js, "endpoint");
+            if !endpoint || !copy_c_string(*voice.endpoint, endpoint, "endpoint")
+                         || !copy_c_string(*voice.token, json_string(d, js, "token"), "token") {
+                stop_voice_ws();
+                voice.token[0] = 0;
+                return;
+            }
+            if voice.session_id[0]  start_voice_ws();
     }
 }
 
 // Leaves `to` empty when `from` doesn't fit.
-copy_c_string :: (to: *[64]u8, from: *u8, what: string) -> bool {
-    length := c_style_strlen(from);
-    if length >= to.count {
-        print("Discord sent a % of % bytes, which is more than we can hold. Ignoring it.\n", what, length);
+copy_c_string :: (to: *[64]u8, from: string, what: string) -> bool {
+    if from.count >= to.count {
+        print("Discord sent a % of % bytes, which is more than we can hold. Ignoring it.\n", what, from.count);
         to.*[0] = 0;
         return false;
     }
-    memcpy(to.data, from, length + 1);
+    memcpy(to.data, from.data, from.count);
+    to.*[from.count] = 0;
     return true;
 }
 
@@ -279,31 +259,30 @@ copy_c_string :: (to: *[64]u8, from: *u8, what: string) -> bool {
 // Slash commands
 //
 
-command_handle :: (client: *void, event: *Discord_Interaction) -> string {
-    if !event.guild_id return "This command only works in a server.";
+command_handle :: (interaction: *Interaction) -> string {
+    if !interaction.guild_id return "This command only works in a server.";
 
-    name := to_string(event.data.name);
+    name := interaction.command;
 
     if name == "play" {
-        file := string_option(event.data, "file");  // optional: without it, play from the top
+        file := string_option(interaction, "file");  // optional: without it, play from the top
 
-        caller := ifx event.member && event.member.user then event.member.user.id else 0;
-        channel_id := voice_channel_of(event.guild_id, caller);
+        channel_id := voice_channel_of(interaction.guild_id, interaction.user_id);
         if !channel_id  return "Join an audio channel first, or use /join to pick one.";
 
-        return join_and_play(client, event.guild_id, channel_id, file);
+        return join_and_play(interaction.guild_id, channel_id, file);
     }
 
     if name == "join" {
-        channel_id, found := channel_option(event.data, "channel");
+        channel_id, found := channel_option(interaction, "channel");
         if !found return "Pick an audio channel.";
-        file := string_option(event.data, "file");
+        file := string_option(interaction, "file");
 
-        return join_and_play(client, event.guild_id, channel_id, file);
+        return join_and_play(interaction.guild_id, channel_id, file);
     }
 
     if name == "stop" {
-        if event.guild_id != voice.guild_id
+        if interaction.guild_id != voice.guild_id
             return "Not connected to any channel in this server.";
 
         stopped := player_stop();
@@ -312,11 +291,10 @@ command_handle :: (client: *void, event: *Discord_Interaction) -> string {
     }
 
     if name == "leave" {
-        if event.guild_id != voice.guild_id
+        if interaction.guild_id != voice.guild_id
             return "Not connected to any channel in this server.";
 
-        update := Discord_Update_Voice_State.{ guild_id = event.guild_id, channel_id = 0 };
-        discord_update_voice_state(client, *update);
+        discord_update_voice_state(interaction.guild_id, 0);
 
         reset_voice();
         return "Leaving the audio channel.";
@@ -325,7 +303,7 @@ command_handle :: (client: *void, event: *Discord_Interaction) -> string {
     return tprint("Unrecognized command: `%`.", name);
 }
 
-join_and_play :: (client: *void, guild_id: u64, channel_id: u64, file: string) -> string {
+join_and_play :: (guild_id: u64, channel_id: u64, file: string) -> string {
     if voice.guild_id != 0 && voice.guild_id != guild_id
         return "Already connected in another server, doing nothing.";
 
@@ -344,8 +322,7 @@ join_and_play :: (client: *void, guild_id: u64, channel_id: u64, file: string) -
     voice.guild_id = guild_id;
     voice.channel_id = channel_id;
     voice.token[0] = 0;  // wait for the new server before connecting; the session id stays valid
-    update := Discord_Update_Voice_State.{ guild_id = guild_id, channel_id = channel_id, self_mute = false, self_deaf = true };
-    discord_update_voice_state(client, *update);
+    discord_update_voice_state(guild_id, channel_id, self_deaf = true);
     return tprint("Joining <#%> to play %.", channel_id, what);
 }
 
@@ -421,67 +398,43 @@ voice_channel_of :: (guild_id: u64, user_id: u64) -> u64 {
     return 0;
 }
 
-find_option :: (data: *Discord_Interaction_Data, name: string) -> *Discord_Interaction_Option {
-    if !data.options return null;
-    for 0..data.options.size - 1 {
-        option := *data.options.array[it];
-        if to_string(option.name) == name  return option;
-    }
-    return null;
+string_option :: (interaction: *Interaction, name: string) -> string, found: bool {
+    for interaction.options  if it.name == name  return it.value, it.value != "";
+    return "", false;
 }
 
-channel_option :: (data: *Discord_Interaction_Data, name: string) -> id: u64, found: bool {
-    option := find_option(data, name);
-    if !option || !option.value  return 0, false;
+channel_option :: (interaction: *Interaction, name: string) -> id: u64, found: bool {
+    value, found := string_option(interaction, name);
+    if !found  return 0, false;
 
-    id, success := string_to_int(to_string(option.value), 10, u64);
+    id, success := string_to_int(value, 10, u64);
     return id, success;
 }
 
-string_option :: (data: *Discord_Interaction_Data, name: string) -> string, found: bool {
-    option := find_option(data, name);
-    if !option || !option.value  return "", false;
-
-    json := to_string(option.value);
-    if !json  return "", false;
-
-    buffer := cast(*u8) talloc(json.count + 1);
-    length := jsmnf_unescape(buffer, xx (json.count + 1), json.data, xx json.count);
-    if length <= 0  return "", false;
-    return .{length, buffer}, true;
+send_reply :: (interaction: *Interaction, text: string) {
+    discord_respond(interaction, "Couldn't reply", tprint("{\"type\":%,\"data\":{\"content\":%,\"flags\":%}}",
+        DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE, json_quote(text), DISCORD_MESSAGE_EPHEMERAL));
 }
 
-send_reply :: (client: *void, event: *Discord_Interaction, text: string) {
-    data := Discord_Interaction_Callback_Data.{content = temp_c_string(text), flags = DISCORD_MESSAGE_EPHEMERAL};
-    response := Discord_Interaction_Response.{type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE, data = *data};
-
-    ret := Discord_Ret.{fail = on_request_failed};
-    code := discord_create_interaction_response(client, event.id, event.token, *response, *ret);
-    report_if_failed("Couldn't reply", client, code);
-}
-
-send_file_suggestions :: (client: *void, event: *Discord_Interaction) {
-    query := string_option(event.data, "file");
+send_file_suggestions :: (interaction: *Interaction) {
+    query := string_option(interaction, "file");
     words := split(to_lower_copy(query,, temp), " ",, temp);
 
-    choices: [DISCORD_MAX_AUTOCOMPLETE_CHOICES]Discord_Command_Option_Choice;
+    choices: String_Builder;
+    choices.allocator = temp;
     count := 0;
     for scan_music_folder() {
-        if count == choices.count  break;
+        if count == DISCORD_MAX_AUTOCOMPLETE_CHOICES  break;
         if character_count(it) > DISCORD_MAX_CHOICE_LENGTH  continue;
         if !matches_all(to_lower_copy(it,, temp), words)  continue;
 
-        choices[count] = .{name = temp_c_string(it), value = temp_c_string(json_quote(it))};
+        quoted := json_quote(it);
+        print_to_builder(*choices, "%{\"name\":%,\"value\":%}", ifx count then "," else "", quoted, quoted);
         count += 1;
     }
 
-    list := discord_list(array_view(choices, 0, count));
-    data := Discord_Interaction_Callback_Data.{choices = *list};
-    response := Discord_Interaction_Response.{type = DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE_RESULT, data = *data};
-
-    ret := Discord_Ret.{fail = on_request_failed};
-    code := discord_create_interaction_response(client, event.id, event.token, *response, *ret);
-    report_if_failed("Couldn't send suggestions", client, code);
+    discord_respond(interaction, "Couldn't send suggestions", tprint("{\"type\":%,\"data\":{\"choices\":[%]}}",
+        DISCORD_INTERACTION_APPLICATION_COMMAND_AUTOCOMPLETE_RESULT, builder_to_string(*choices,, temp)));
 }
 
 matches_all :: (text: string, words: []string) -> bool {
@@ -514,67 +467,25 @@ json_quote :: (s: string) -> string {
     return builder_to_string(*builder,, temp);
 }
 
-discord_list :: (items: []$T) -> Discord_List(T) {
-    return .{size = xx items.count, array = items.data};
-}
+register_commands :: (application_id: u64) {
+    FILE_OPTION :: #run tprint("{\"type\":%,\"name\":\"file\",\"description\":\"File to start from, inside the music folder (default: the first one)\",\"autocomplete\":true}",
+        DISCORD_APPLICATION_OPTION_STRING);
+    CHANNEL_OPTION :: #run tprint("{\"type\":%,\"name\":\"channel\",\"description\":\"Audio channel to join\",\"required\":true,\"channel_types\":[%,%]}",
+        DISCORD_APPLICATION_OPTION_CHANNEL, DISCORD_CHANNEL_GUILD_VOICE, DISCORD_CHANNEL_GUILD_STAGE_VOICE);
 
-// The lists point at these locals, which is fine because Concord serializes them during the call.
-register_commands :: (client: *void, application_id: u64) {
-    audio_channel_types := s32.[DISCORD_CHANNEL_GUILD_VOICE, DISCORD_CHANNEL_GUILD_STAGE_VOICE];
-    channel_types := discord_list(audio_channel_types);
-
-    file := Discord_Command_Option.{
-        type = DISCORD_APPLICATION_OPTION_STRING,
-        name = "file",
-        description = "File to start from, inside the music folder (default: the first one)",
-        autocomplete = true,
-    };
-    channel := Discord_Command_Option.{
-        type = DISCORD_APPLICATION_OPTION_CHANNEL,
-        name = "channel",
-        description = "Audio channel to join",
-        required = true,
-        channel_types = *channel_types,
-    };
-    play_array := Discord_Command_Option.[file];
-    join_array := Discord_Command_Option.[channel, file];
-    play_options := discord_list(play_array);
-    join_options := discord_list(join_array);
-
-    command :: (name: *u8, description: *u8, options: *Discord_List(Discord_Command_Option) = null) -> Discord_Command {
-        return .{
-            type = DISCORD_APPLICATION_CHAT_INPUT,
-            name = name,
-            description = description,
-            options = options,
-            default_member_permissions = DISCORD_PERMISSION_ADMINISTRATOR,
-            default_permission = true,
-        };
+    command :: (name: string, description: string, options: .. string) -> string {
+        return tprint("{\"type\":%,\"name\":%,\"description\":%,\"options\":[%],\"default_member_permissions\":\"%\"}",
+            DISCORD_APPLICATION_CHAT_INPUT, json_quote(name), json_quote(description), join(.. options, ",",, temp),
+            DISCORD_PERMISSION_ADMINISTRATOR);
     }
-    command_array := Discord_Command.[
-        command("play",  "Join your audio channel and play the music folder", *play_options),
-        command("join",  "Join an audio channel and play the music folder", *join_options),
+    body := tprint("[%,%,%,%]",
+        command("play",  "Join your audio channel and play the music folder", FILE_OPTION),
+        command("join",  "Join an audio channel and play the music folder", CHANNEL_OPTION, FILE_OPTION),
         command("stop",  "Stop playing"),
-        command("leave", "Leave the audio channel"),
-    ];
-    commands := discord_list(command_array);
+        command("leave", "Leave the audio channel"));
 
-    ret := Discord_Ret.{fail = on_request_failed};
-    code := discord_bulk_overwrite_global_application_commands(client, application_id, *commands, *ret);
-    report_if_failed("Couldn't register commands", client, code);
-}
-
-// Concord's logs are off by default, so without this a failed request is invisible.
-on_request_failed :: (client: *void, response: *Discord_Response) #c_call {
-    new_context: Context;
-    push_context new_context {
-        print("Discord request failed: %\n", to_string(discord_strerror(response.code, client)));
-    }
-}
-
-report_if_failed :: (action: string, client: *void, code: s32) {
-    if code == CCORD_OK || code == CCORD_PENDING return;
-    print("%: %\n", action, to_string(discord_strerror(code, client)));
+    status, response := rest_request("PUT", tprint("/applications/%/commands", application_id), body);
+    discord_report_if_failed("Couldn't register commands", status, response);
 }
 
 //
@@ -651,8 +562,7 @@ voice_ws_thread :: (thread: *Thread) -> s64 {
 
     while !gotta_stop {
         reset_temporary_storage();
-        pfd := pollfd.{fd = ws.socket, events = POLLIN};
-        poll(*pfd, 1, ws_ms_until_next_wakeup(ws));       // at most ~250 ms, so stop_requested is noticed
+        wait_readable(ws.socket, ws_ms_until_next_wakeup(ws));       // at most ~250 ms, so stop_requested is noticed
         if !ws_drain(ws) break;
         if ws.heartbeat_interval_ms > 0 && current_time_monotonic() >= ws.next_heartbeat
             if !ws_send_heartbeat(ws)  break;
@@ -1262,6 +1172,12 @@ get_u32_be :: (p: *u8) -> u32 {
     return ((cast(u32) p[0]) << 24) | ((cast(u32) p[1]) << 16) | ((cast(u32) p[2]) << 8) | p[3];
 }
 
+// Waits until the socket has something to read, or the timeout passes.
+wait_readable :: (socket: curl_socket_t, timeout_ms: s32) {
+    pfd := pollfd.{fd = socket, events = POLLIN};
+    poll(*pfd, 1, timeout_ms);
+}
+
 //
 // JSON helpers
 //
@@ -1273,6 +1189,45 @@ json_text :: (p: *Jsmnf_Pair, js: string) -> string {
 json_find :: (obj: *Jsmnf_Pair, js: string, key: string) -> *Jsmnf_Pair {
     if !obj return null;
     return jsmnf_find(obj, js.data, key.data, xx key.count);
+}
+
+// Parses `text` into `pairs`. Returns the root, or null when it isn't JSON or doesn't fit.
+json_load :: (text: string, tokens: []Jsmn_Token, pairs: []Jsmnf_Pair) -> *Jsmnf_Pair {
+    parser: Jsmn_Parser;
+    jsmn_init(*parser);
+    num_tokens := jsmn_parse(*parser, text.data, xx text.count, tokens.data, xx tokens.count);
+    if num_tokens <= 0  return null;
+
+    loader: Jsmnf_Loader;
+    jsmnf_init(*loader);
+    if jsmnf_load(*loader, text.data, tokens.data, xx num_tokens, pairs.data, xx pairs.count) <= 0  return null;
+    return pairs.data;
+}
+
+// The value as text: strings unescaped, anything else as it is in the JSON.
+json_value :: (pair: *Jsmnf_Pair, js: string) -> string {
+    text := json_text(pair, js);
+    if pair.type != JSMN_STRING || !text  return text;
+
+    buffer := cast(*u8) talloc(text.count + 1);
+    length := jsmnf_unescape(buffer, xx (text.count + 1), text.data, xx text.count);
+    if length <= 0  return "";
+    return .{length, buffer};
+}
+
+// Empty when the key is missing or isn't a string.
+json_string :: (obj: *Jsmnf_Pair, js: string, key: string) -> string {
+    pair := json_find(obj, js, key);
+    if !pair || pair.type != JSMN_STRING  return "";
+    return json_value(pair, js);
+}
+
+// A snowflake. 0 when the key is missing or null.
+json_id :: (obj: *Jsmnf_Pair, js: string, key: string) -> u64 {
+    pair := json_find(obj, js, key);
+    if !pair || pair.type != JSMN_STRING  return 0;
+    id, ok := string_to_int(json_text(pair, js), 10, u64);
+    return ifx ok then id else 0;
 }
 
 json_int :: (obj: *Jsmnf_Pair, js: string, key: string) -> s64, found: bool {
