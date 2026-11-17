@@ -1,5 +1,9 @@
 .build
 *.a
+*.lib
+*.obj
+*.exe
+*.pdb
 bot-key
 main
 output

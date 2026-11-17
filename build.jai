@@ -41,6 +41,7 @@
         run("libdave (configure)", "cmake", "-S", "vendor/libdave/cpp", "-B", ".deps/libdave",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DBUILD_SHARED_LIBS=OFF",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
             "-DTESTING=OFF",
             tprint("-DCMAKE_TOOLCHAIN_FILE=%/%/scripts/buildsystems/vcpkg.cmake", root, VCPKG_DIR),
             tprint("-DVCPKG_TARGET_TRIPLET=%", TRIPLET),
@@ -50,18 +51,39 @@
     }
     run("libdave", "cmake", "--build", ".deps/libdave", "--target", "libdave", "--config", "Release", "-j");
 
-    gcc_result, gcc_output := run_command("c++", "-print-file-name=libstdc++.a", capture_and_return_output = true);
-    stdcpp_archive := trim(gcc_output);
-    if gcc_result.exit_code != 0 || !file_exists(stdcpp_archive) {
-        compiler_report("Couldn't find libstdc++.a with \"c++ -print-file-name\".");
-    }
-    gcc_dir := path_strip_filename(stdcpp_archive);
+    #if OS == .WINDOWS {
+        return tprint(#string DONE
+libcurl :: #library,no_dll,link_always "%1libcurl";
+opus    :: #library,no_dll "%1opus";
+dave    :: #library,no_dll ".deps/libdave/Release/libdave";
+_ :: #library,no_dll,link_always "%1mlspp";
+_ :: #library,no_dll,link_always "%1hpke";
+_ :: #library,no_dll,link_always "%1tls_syntax";
+_ :: #library,no_dll,link_always "%1bytes";
+_ :: #library,no_dll,link_always "%1libssl";
+libcrypto :: #library,no_dll,link_always "%1libcrypto";
+_ :: #library,no_dll,link_always "%1zlib";
+_ :: #library,system,no_dll,link_always "libcpmt";
+_ :: #library,system,no_dll,link_always "oldnames";
+_ :: #library,system,link_always "ws2_32";
+_ :: #library,system,link_always "bcrypt";
+_ :: #library,system,link_always "advapi32";
+_ :: #library,system,link_always "crypt32";
+_ :: #library,system,link_always "user32";
+DONE, lib);
+    } else {
+        gcc_result, gcc_output := run_command("c++", "-print-file-name=libstdc++.a", capture_and_return_output = true);
+        stdcpp_archive := trim(gcc_output);
+        if gcc_result.exit_code != 0 || !file_exists(stdcpp_archive) {
+            compiler_report("Couldn't find libstdc++.a with \"c++ -print-file-name\".");
+        }
+        gcc_dir := path_strip_filename(stdcpp_archive);
 
-    up: String_Builder;
-    for split(root, "/")  if it  append(*up, "../");
-    gcc_dir = tprint("%1%2", builder_to_string(*up), gcc_dir);
+        up: String_Builder;
+        for split(root, "/")  if it  append(*up, "../");
+        gcc_dir = tprint("%1%2", builder_to_string(*up), gcc_dir);
 
-    return tprint(#string DONE
+        return tprint(#string DONE
 libcurl :: #library,no_dll,link_always "%1libcurl";
 opus    :: #library,no_dll "%1libopus";
 dave    :: #library,no_dll ".deps/libdave/libdave";
@@ -76,6 +98,7 @@ _ :: #library,no_dll,link_always "%2libstdc++";
 _ :: #library,no_dll,link_always "%2libgcc_eh";
 _ :: #library,no_dll,link_always "%2libgcc";
 DONE, lib, gcc_dir);
+    }
 }
 
 #run {
@@ -83,7 +106,8 @@ DONE, lib, gcc_dir);
 
     // Compiling miniaudio takes ~11s, so only rebuild a library when its sources changed.
     build_if_changed :: (name: string, sources: .. string) {
-        lib_time, _, lib_exists := file_modtime_and_size(tprint("%.a", name));
+        LIB_EXTENSION :: #ifx OS == .WINDOWS then "lib" else "a";
+        lib_time, _, lib_exists := file_modtime_and_size(tprint("%.%", name, LIB_EXTENSION));
         needs_rebuild := !lib_exists;
         for sources {
             if needs_rebuild break;

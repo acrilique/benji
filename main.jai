@@ -3,11 +3,12 @@
 #import "Command_Line";
 #import "File";
 #import "File_Utilities";
-#import "POSIX";
 #import "Socket";
 #import "Sort";
 #import "String";
 #import "Thread";
+
+#if OS != .WINDOWS  #import "POSIX";
 
 #load "build.jai";
 #load "ffi.jai";
@@ -586,7 +587,7 @@ ws_ms_until_next_wakeup :: (ws: *Voice_Ws) -> s32 {
 ws_connect :: (ws: *Voice_Ws) -> bool {
     url := to_c_string(tprint("wss://%/?v=8", ws.endpoint));
     defer free(url);
-    ws.curl = curl_easy_init();
+    ws.curl = curl_handle_create();
     if !ws.curl {
         print("curl_easy_init failed\n");
         return false; 
@@ -1088,7 +1089,7 @@ udp_open :: (ws: *Voice_Ws) -> bool {
 
     ws.udp = socket(AF_INET, .SOCK_DGRAM, .IPPROTO_UDP);
     if ws.udp == INVALID_SOCKET {
-        print("Couldn't create the UDP socket: %\n", errno());
+        print("Couldn't create the UDP socket: %\n", get_last_socket_error());
         return false;
     }
 
@@ -1103,15 +1104,19 @@ udp_open :: (ws: *Voice_Ws) -> bool {
     }
 
     if connect(ws.udp, cast(*sockaddr) *address, size_of(sockaddr_in)) != 0 {
-        print("Couldn't connect the UDP socket to %:%: %\n", ws.ip, ws.port, errno());
+        print("Couldn't connect the UDP socket to %:%: %\n", ws.ip, ws.port, get_last_socket_error());
         return false;
     }
 
-    timeout: timeval;
-    timeout.tv_sec  = IP_DISCOVERY_TIMEOUT_MS / 1000;
-    timeout.tv_usec = (IP_DISCOVERY_TIMEOUT_MS % 1000) * 1000;
-    if setsockopt(ws.udp, SOL_SOCKET, SO_RCVTIMEO, *timeout, size_of(timeval)) != 0 {
-        print("Couldn't set the UDP receive timeout: %\n", errno());
+    #if OS == .WINDOWS {
+        timeout: u32 = IP_DISCOVERY_TIMEOUT_MS;
+    } else {
+        timeout: timeval;
+        timeout.tv_sec  = IP_DISCOVERY_TIMEOUT_MS / 1000;
+        timeout.tv_usec = (IP_DISCOVERY_TIMEOUT_MS % 1000) * 1000;
+    }
+    if setsockopt(ws.udp, SOL_SOCKET, SO_RCVTIMEO, xx *timeout, size_of(type_of(timeout))) != 0 {
+        print("Couldn't set the UDP receive timeout: %\n", get_last_socket_error());
         return false;
     }
 
@@ -1129,14 +1134,16 @@ udp_discover_ip :: (ws: *Voice_Ws) -> bool {
     for attempt: 1..IP_DISCOVERY_ATTEMPTS {
         sent := send(ws.udp, request.data, request.count, 0);
         if sent != request.count {
-            print("IP discovery: send failed (%), attempt %/%\n", errno(), attempt, IP_DISCOVERY_ATTEMPTS);
+            print("IP discovery: send failed (%), attempt %/%\n", get_last_socket_error(), attempt, IP_DISCOVERY_ATTEMPTS);
             continue;
         }
 
         got := recv(ws.udp, reply.data, reply.count, 0);
         if got < 0 {
-            err := errno();
-            if err == EAGAIN || err == EWOULDBLOCK
+            err := get_last_socket_error();
+            #if OS == .WINDOWS  timed_out := err == WSAETIMEDOUT;
+            else                timed_out := err == EAGAIN || err == EWOULDBLOCK;
+            if timed_out
                 print("IP discovery: no reply within % ms, attempt %/%\n", IP_DISCOVERY_TIMEOUT_MS, attempt, IP_DISCOVERY_ATTEMPTS);
             else
                 print("IP discovery: recv failed (%), attempt %/%\n", err, attempt, IP_DISCOVERY_ATTEMPTS);
@@ -1175,7 +1182,8 @@ get_u32_be :: (p: *u8) -> u32 {
 // Waits until the socket has something to read, or the timeout passes.
 wait_readable :: (socket: curl_socket_t, timeout_ms: s32) {
     pfd := pollfd.{fd = socket, events = POLLIN};
-    poll(*pfd, 1, timeout_ms);
+    #if OS == .WINDOWS  WSAPoll(*pfd, 1, timeout_ms);
+    else                poll(*pfd, 1, timeout_ms);
 }
 
 //
@@ -1417,7 +1425,7 @@ send_frame_on_schedule :: (ws: *Voice_Ws, opus: []u8, next_frame: *Apollo_Time, 
 
     if !error {
         sent := send(ws.udp, packet.data, xx length, 0);
-        if sent != length  error = tprint("UDP send failed (%)", errno());
+        if sent != length  error = tprint("UDP send failed (%)", get_last_socket_error());
     }
 
     if error {

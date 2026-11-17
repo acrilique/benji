@@ -1,10 +1,6 @@
 //
 // Discord's gateway and REST API, on libcurl. Everything here runs on the main thread.
 //
-// The session rules (when to resume, when to start over, when to give up) are the ones
-// Concord had in src/discord-gateway.c. Two things differ: consecutive failed attempts
-// wait before the next one, and a heartbeat that Discord asks for (op 1) gets sent.
-//
 
 DISCORD_API_URL       :: "https://discord.com/api/v10";
 DISCORD_GATEWAY_QUERY :: "?v=10&encoding=json";
@@ -182,7 +178,7 @@ gateway_connect :: (gw: *Gateway) -> Gateway_Connect_Result, reason: string {
         url = gateway_url(base_url);
     }
 
-    gw.curl = curl_easy_init();
+    gw.curl = curl_handle_create();
     if !gw.curl {
         print("Gateway: curl_easy_init failed\n");
         return .FAILED, "";
@@ -473,7 +469,7 @@ decode_interaction :: (d: *Jsmnf_Pair, js: string) -> Interaction, ok: bool {
 //
 
 rest_init :: (token: string) -> bool {
-    rest.curl = curl_easy_init();
+    rest.curl = curl_handle_create();
     if !rest.curl  return false;
 
     rest.headers = curl_slist_append(null, temp_c_string(tprint("Authorization: Bot %", token)));

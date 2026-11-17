@@ -4,7 +4,7 @@
 
 decoder :: #library,no_dll "decoder";
 json    :: #library,no_dll "json";
-_ :: #library,system,link_always "libm";
+#if OS != .WINDOWS  _ :: #library,system,link_always "libm";
 // `libcurl`, `opus`, `dave` (libdave) and `libcrypto` (OpenSSL) are declared in
 // build.jai, which builds them.
 
@@ -128,7 +128,8 @@ CURL :: void;
 curl_off_t :: s64;
 #if OS == .WINDOWS  C_Long :: s32;
 else                C_Long :: s64;
-curl_socket_t :: s32;
+#if OS == .WINDOWS  curl_socket_t :: u64;  // a SOCKET
+else                curl_socket_t :: s32;
 
 CURLE_OK    :: 0;
 CURLE_AGAIN :: 81;  // nothing to read, or the socket can't take more yet
@@ -141,6 +142,7 @@ CURLOPT_HTTPGET           :: 80;
 CURLOPT_CONNECT_ONLY      :: 141;  // set to 2 for WebSocket: stop after the upgrade
 CURLOPT_TIMEOUT_MS        :: 155;
 CURLOPT_CONNECTTIMEOUT_MS :: 156;
+CURLOPT_SSL_OPTIONS       :: 216;
 CURLOPT_WRITEDATA         :: 10001;
 CURLOPT_URL               :: 10002;
 CURLOPT_POSTFIELDS        :: 10015;  // not copied: the body must stay valid until the request ends
@@ -171,6 +173,14 @@ Curl_Ws_Frame :: struct {
 
 curl_global_init :: (flags: C_Long) -> s32 #foreign libcurl;
 curl_easy_init :: () -> *CURL #foreign libcurl;
+
+CURLSSLOPT_NATIVE_CA :: 1 << 4;
+
+curl_handle_create :: () -> *CURL {
+    curl := curl_easy_init();
+    #if OS == .WINDOWS  if curl  curl_easy_setopt_long(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+    return curl;
+}
 curl_easy_cleanup :: (curl: *CURL) -> void #foreign libcurl;
 curl_easy_perform :: (curl: *CURL) -> s32 #foreign libcurl;
 curl_easy_strerror :: (code: s32) -> *u8 #foreign libcurl;
