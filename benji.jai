@@ -1,6 +1,23 @@
 //
 // Benji: a Discord bot that plays a folder of audio files in a voice channel.
 //
+// Copyright (C) 2026 Lluc Simó Margalef <lluc.simo@protonmail.com>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
 // Build:  jai benji.jai   (this also builds the C and C++ dependencies, see "Libraries and build")
 // Run:    benji -music_folder <path>   with the bot's token in the file `bot-key`
 //
@@ -8,15 +25,6 @@
 //   - The main thread runs the Discord gateway and handles the slash commands.
 //   - The voice thread, one per voice connection, runs the voice WebSocket and DAVE.
 //   - The audio thread, started by the voice thread, decodes, encodes, encrypts and sends audio.
-//
-// The file goes from what the bot does down to what it is built on:
-//
-//   The bot       Constants, entry point, Discord event handlers, slash commands,
-//                 music folder, members' voice states, replies, player
-//   Voice         Connection, WebSocket, DAVE, UDP, transport encryption, audio
-//   Discord       Constants, gateway, interactions, REST, WebSocket
-//   Helpers       JSON, bytes and waiting
-//   Foreign code  Libraries and build, bindings
 //
 
 #import "Atomics";

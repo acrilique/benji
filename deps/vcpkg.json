@@ -1,6 +1,7 @@
 {
   "name": "audio-player-discord-bot",
   "description": "Native libraries linked by the bot, built statically by vcpkg so there is exactly one OpenSSL.",
+  "license": "GPL-3.0-or-later",
   "dependencies": [
     "openssl",
     {
