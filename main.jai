@@ -112,8 +112,8 @@ Player :: struct {
 
 player: Player;
 
-// What the gateway told us about our voice session. Main thread only.
-// An empty session_id or token means that update hasn't arrived yet.
+// What the gateway told us about our voice session. `voice` is main thread only; the voice
+// thread gets its own copy. An empty session_id or token means that update hasn't arrived yet.
 Voice_Connection :: struct {
     session_id: [64]u8;
     token: [64]u8;
@@ -126,17 +126,15 @@ voice: Voice_Connection;
 
 // One connection to a voice server, shared by the main, voice and audio threads.
 Voice_Ws :: struct {
-    // Set by the main thread before the voice thread starts, then only read.
-    endpoint, session_id, token: string;
-    guild_id: u64;
-    channel_id: u64;
+    // Copied by the main thread before the voice thread starts, then only read.
+    using connection: Voice_Connection;
 
     stop_requested: bool;  // the main thread asks the voice thread to end
     audio_stop: bool;      // the voice thread asks the audio thread to end
 
     // Voice thread only.
     socket: curl_socket_t;
-    rx: [65536]u8;  rx_len: s64;
+    rx: [..]u8;
     heartbeat_interval_ms: float64;
     next_heartbeat: Apollo_Time;
     last_seq: s64 = -1;
@@ -494,19 +492,11 @@ register_commands :: (application_id: u64) {
 //
 
 start_voice_ws :: () {
-    stop_voice_ws();    
+    stop_voice_ws();
 
-    voice_ws.endpoint = copy_string(to_string(voice.endpoint.data));
-    voice_ws.session_id = copy_string(to_string(voice.session_id.data));
-    voice_ws.token = copy_string(to_string(voice.token.data));
-    voice_ws.guild_id = voice.guild_id;
-    voice_ws.channel_id = voice.channel_id;
-
+    voice_ws.connection = voice;
     if !thread_init(*voice_thread, voice_ws_thread) {
         print("Failed to create the voice WS thread\n");
-        free(voice_ws.endpoint);
-        free(voice_ws.session_id);
-        free(voice_ws.token);
         voice_ws = .{};
         return;
     }
@@ -522,9 +512,6 @@ stop_voice_ws :: () {
     atomic_write(*voice_ws.stop_requested, true);
     thread_is_done(*voice_thread, -1);
     thread_deinit(*voice_thread);
-    free(voice_ws.endpoint);
-    free(voice_ws.session_id);
-    free(voice_ws.token);
     destroy(*voice_ws.dave_mutex);
     destroy(*voice_ws.curl_mutex);
     voice_ws = .{};
@@ -550,8 +537,9 @@ reset_voice :: () {
 
 voice_ws_thread :: (thread: *Thread) -> s64 {
     ws := cast(*Voice_Ws) thread.data;
-    defer { free(ws.ip); free(ws.external_ip); array_free(ws.dave_pending_transitions); }
-    if !ws_connect(ws) return 1;
+    defer { free(ws.ip); free(ws.external_ip); array_free(ws.rx); array_free(ws.dave_pending_transitions); }
+    ws.curl, ws.socket = websocket_open(tprint("wss://%/?v=8", to_string(ws.endpoint.data)), "Voice WS");
+    if !ws.curl  return 1;
     defer curl_easy_cleanup(ws.curl);
     defer close_and_reset(*ws.udp);
     defer transport_destroy(ws);
@@ -584,99 +572,42 @@ ws_ms_until_next_wakeup :: (ws: *Voice_Ws) -> s32 {
     return xx clamp(ms, 0, 250);
 }
 
-ws_connect :: (ws: *Voice_Ws) -> bool {
-    url := to_c_string(tprint("wss://%/?v=8", ws.endpoint));
-    defer free(url);
-    ws.curl = curl_handle_create();
-    if !ws.curl {
-        print("curl_easy_init failed\n");
-        return false; 
-    }
-    curl_easy_setopt_ptr(ws.curl, CURLOPT_URL, url);
-    curl_easy_setopt_long(ws.curl, CURLOPT_CONNECT_ONLY, 2);
-    curl_easy_setopt_long(ws.curl, CURLOPT_CONNECTTIMEOUT_MS, 10000);
-    ret := curl_easy_perform(ws.curl);
-    if ret != CURLE_OK {
-        print("Error during websocket establish: %\n", to_string(curl_easy_strerror(ret)));
-        curl_easy_cleanup(ws.curl);
-        ws.curl = null;
-        return false;
-    }
-
-    curl_easy_getinfo_socket(ws.curl, CURLINFO_ACTIVESOCKET, *ws.socket);
-
-    print("Voice WS connected: %\n", ws.endpoint);
-    return true;
-}
-
 ws_drain :: (ws: *Voice_Ws) -> bool {
-    got: u64;
-    meta: *Curl_Ws_Frame;
-    
-    while (true) {
+    while true {
         lock(*ws.curl_mutex);
-        ret := curl_ws_recv(ws.curl, ws.rx.data + ws.rx_len, xx (ws.rx.count - ws.rx_len), *got, *meta);
+        event, msg, code := websocket_recv(ws.curl, *ws.rx);
         unlock(*ws.curl_mutex);
-        if ret == {
-            case CURLE_AGAIN; return true;
-            case CURLE_OK;
-                ws.rx_len += xx got;                
-                if meta.bytesleft > 0 {
-                    if ws.rx_len == ws.rx.count {
-                        print("Message too big: rx_len = %, rx.count = %\n", ws.rx_len, ws.rx.count);
-                        return false;
-                    }
+        if event == {
+            case .NOTHING;  return true;
+            case .CLOSED;
+                print("Voice WS closed: % '%'\n", code, msg);
+                return false;
+            case .TEXT;
+                if !handle_text(ws, msg)  return false;
+            case .BINARY;
+                if msg.count < 3 {
+                    print("<- binary message too short (%)\n", msg.count);
                     continue;
                 }
-                msg := string.{ws.rx_len, ws.rx.data};
-                ws.rx_len = 0;
-                if meta.flags & CURLWS_CLOSE {
-                    code := ifx msg.count >= 2 then get_u16_be(msg.data) else 0;
-                    reason := ifx msg.count > 2 then slice(msg, 2, msg.count - 2) else "";
-                    print("Voice WS closed by Discord: "); 
-                    if code != 0 print("% '%'\n", code, reason);
-                    else print("no code\n");
-                    return false;
-                }
-                if meta.flags & CURLWS_TEXT {
-                    if !handle_text(ws, msg)  return false;
-                }
-                if meta.flags & CURLWS_BINARY {
-                    if msg.count < 3 {
-                        print("<- binary message too short (%)\n", msg.count);
-                        continue;
-                    }
-
-                    ws.last_seq = get_u16_be(msg.data);
-                    if !handle_binary(ws, msg[2], .{msg.count - 3, msg.data + 3})  return false;
-                }
-            case;
-                print("Connection lost: %\n", to_string(curl_easy_strerror(ret)));
-                return false;
+                ws.last_seq = get_u16_be(msg.data);
+                if !handle_binary(ws, msg[2], .{msg.count - 3, msg.data + 3})  return false;
         }
     }
     return false;
 }
 
 handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
-    parser: Jsmn_Parser;
+    // For messages that can't be acted on: logs it and goes on with the next one.
+    skip :: (what: string) -> bool { print("% is missing fields, ignoring it\n", what); return true; }
+
     tokens: [128]Jsmn_Token;
-    jsmn_init(*parser);
-    num_tokens := jsmn_parse(*parser, msg.data, xx msg.count, tokens.data, tokens.count);
-    if num_tokens < 0 {
-        print("<- %\nBad JSON (%)\n", msg, num_tokens);
-        return true;
-    }
-
-    loader: Jsmnf_Loader;
     pairs: [128]Jsmnf_Pair;
-    jsmnf_init(*loader);
-    if jsmnf_load(*loader, msg.data, tokens.data, xx num_tokens, pairs.data, pairs.count) < 0 {
-        print("<- %\nCouldn't load JSON\n", msg);
+    root := json_load(msg, tokens, pairs);
+    if !root {
+        print("<- %\nBad JSON\n", msg);
         return true;
     }
 
-    root := *pairs[0];
     op, has_op := json_int(root, msg, "op");
     if !has_op {
         print("<- %\nMessage without \"op\"\n", msg);
@@ -695,10 +626,7 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
     if op == {
         case 8; // Hello
             interval := json_find(d, msg, "heartbeat_interval");
-            if !interval {
-                print("Message without \"heartbeat_interval\"\n");
-                return true;
-            }
+            if !interval  return skip("Hello");
 
             ws.heartbeat_interval_ms = string_to_float64(json_text(interval, msg));
             ws.next_heartbeat = current_time_monotonic() + milliseconds_to_apollo(xx ws.heartbeat_interval_ms);
@@ -801,27 +729,18 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
         case 21; // DAVE Prepare Transition
             transition_id, has_id := json_int(d, msg, "transition_id");
             version, has_version   := json_int(d, msg, "protocol_version");
-            if !has_id || !has_version {
-                print("Prepare Transition is missing fields\n");
-                return true;
-            }
+            if !has_id || !has_version  return skip("Prepare Transition");
             dave_lock(ws);
             return dave_prepare_transition(ws, xx transition_id, xx version);
         case 22; // DAVE Execute Transition
             transition_id, has_id := json_int(d, msg, "transition_id");
-            if !has_id {
-                print("Execute Transition is missing transition_id\n");
-                return true;
-            }
+            if !has_id  return skip("Execute Transition");
             dave_lock(ws);
             dave_execute_transition(ws, xx transition_id);
         case 24; // DAVE Prepare Epoch
             epoch, has_epoch     := json_int(d, msg, "epoch");
             version, has_version := json_int(d, msg, "protocol_version");
-            if !has_epoch || !has_version {
-                print("Prepare Epoch is missing fields\n");
-                return true;
-            }
+            if !has_epoch || !has_version  return skip("Prepare Epoch");
             dave_lock(ws);
             return dave_prepare_epoch(ws, epoch, xx version);
         case;
@@ -832,6 +751,18 @@ handle_text :: (ws: *Voice_Ws, msg: string) -> bool {
 
 handle_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
     dave_lock(ws);
+
+    // Commit (29) and Welcome (30) are [transition_id u16][message].
+    transition_id: u16;
+    message := payload;
+    if op == 29 || op == 30 {
+        if payload.count < 2 {
+            print("<- DAVE op % too short (% bytes)\n", op, payload.count);
+            return true;
+        }
+        transition_id = get_u16_be(payload.data);
+        message = .{payload.count - 2, payload.data + 2};
+    }
 
     if op == {
         case 25; // MLS External Sender Package
@@ -846,15 +777,10 @@ handle_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
                 defer daveFree(commit_welcome);
                 return ws_send_binary(ws, 28, .{xx commit_welcome_length, commit_welcome});
             }
-        case 29; // MLS Announce Commit Transition: [transition_id u16][commit]
-            if payload.count < 2 {
-                print("<- DAVE commit too short (% bytes)\n", payload.count);
-                return true;
-            }
-            transition_id := get_u16_be(payload.data);
-            print("<- DAVE commit for transition % (% bytes)\n", transition_id, payload.count - 2);
+        case 29; // MLS Announce Commit Transition
+            print("<- DAVE commit for transition % (% bytes)\n", transition_id, message.count);
 
-            result := daveSessionProcessCommit(ws.dave, payload.data + 2, xx (payload.count - 2));
+            result := daveSessionProcessCommit(ws.dave, message.data, xx message.count);
             defer if result  daveCommitResultDestroy(result);
 
             if result && daveCommitResultIsIgnored(result) {
@@ -869,15 +795,10 @@ handle_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
             }
 
             return dave_prepare_transition(ws, transition_id, daveSessionGetProtocolVersion(ws.dave));
-        case 30; // MLS Welcome: [transition_id u16][welcome]
-            if payload.count < 2 {
-                print("<- DAVE welcome too short (% bytes)\n", payload.count);
-                return true;
-            }
-            transition_id := get_u16_be(payload.data);
-            print("<- DAVE welcome for transition % (% bytes)\n", transition_id, payload.count - 2);
+        case 30; // MLS Welcome
+            print("<- DAVE welcome for transition % (% bytes)\n", transition_id, message.count);
 
-            result := daveSessionProcessWelcome(ws.dave, payload.data + 2, xx (payload.count - 2));
+            result := daveSessionProcessWelcome(ws.dave, message.data, xx message.count);
             if !result {
                 print("DAVE: welcome failed, flagging it and sending a new key package\n");
                 if !ws_send_transition_op(ws, 31, transition_id)  return false;
@@ -894,15 +815,11 @@ handle_binary :: (ws: *Voice_Ws, op: u8, payload: []u8) -> bool {
 }
 
 ws_send :: (ws: *Voice_Ws, data: []u8, flags: u32) -> bool {
-    sent: u64;
     lock(*ws.curl_mutex);
-    ret := curl_ws_send(ws.curl, data.data, xx data.count, *sent, 0, flags);
+    error := websocket_send(ws.curl, data, flags);
     unlock(*ws.curl_mutex);
-    if ret != CURLE_OK || sent != xx data.count {
-        print("Voice WS send failed: % (sent % of %)\n", to_string(curl_easy_strerror(ret)), sent, data.count);
-        return false;
-    }
-    return true;
+    if error  print("Voice WS send failed: %\n", error);
+    return !error;
 }
 
 ws_send_text :: (ws: *Voice_Ws, text: string, log := true) -> bool {
@@ -937,9 +854,10 @@ ws_send_transition_op :: (ws: *Voice_Ws, op: s64, transition_id: u16) -> bool {
 }
 
 ws_send_identify :: (ws: *Voice_Ws) {
-    print("-> Identify (server_id=%, session_id=%, token=***)\n", ws.guild_id, ws.session_id);
+    session_id := to_string(ws.session_id.data);
+    print("-> Identify (server_id=%, session_id=%)\n", ws.guild_id, session_id);
     ws_send_text(ws, tprint("{\"op\":0,\"d\":{\"server_id\":\"%\",\"user_id\":\"%\",\"session_id\":%,\"token\":%,\"max_dave_protocol_version\":1}}",
-        ws.guild_id, bot_user_id, json_quote(ws.session_id), json_quote(ws.token)), log = false);
+        ws.guild_id, bot_user_id, json_quote(session_id), json_quote(to_string(ws.token.data))), log = false);
 }
 
 ws_send_select_protocol :: (ws: *Voice_Ws) -> bool {

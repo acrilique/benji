@@ -136,14 +136,12 @@ CURLE_AGAIN :: 81;  // nothing to read, or the socket can't take more yet
 
 CURL_GLOBAL_DEFAULT :: 3;
 
-CURLOPT_POST              :: 47;
 CURLOPT_POSTFIELDSIZE     :: 60;
 CURLOPT_HTTPGET           :: 80;
 CURLOPT_CONNECT_ONLY      :: 141;  // set to 2 for WebSocket: stop after the upgrade
 CURLOPT_TIMEOUT_MS        :: 155;
 CURLOPT_CONNECTTIMEOUT_MS :: 156;
 CURLOPT_SSL_OPTIONS       :: 216;
-CURLOPT_WRITEDATA         :: 10001;
 CURLOPT_URL               :: 10002;
 CURLOPT_POSTFIELDS        :: 10015;  // not copied: the body must stay valid until the request ends
 CURLOPT_USERAGENT         :: 10018;
@@ -192,8 +190,7 @@ curl_easy_setopt_ptr  :: (curl: *CURL, option: s32, value: *void) -> s32 #foreig
 curl_easy_getinfo_socket :: (curl: *CURL, info: s32, out: *curl_socket_t) -> s32 #foreign libcurl "curl_easy_getinfo";
 curl_easy_getinfo_long   :: (curl: *CURL, info: s32, out: *C_Long) -> s32 #foreign libcurl "curl_easy_getinfo";
 
-curl_slist_append   :: (list: *void, text: *u8) -> *void #foreign libcurl;
-curl_slist_free_all :: (list: *void) -> void #foreign libcurl;
+curl_slist_append :: (list: *void, text: *u8) -> *void #foreign libcurl;
 
 curl_ws_recv :: (curl: *CURL, buffer: *void, buflen: u64, recv: *u64, meta: **Curl_Ws_Frame) -> s32 #foreign libcurl;
 curl_ws_send :: (curl: *CURL, buffer: *void, buflen: u64, sent: *u64, fragsize: curl_off_t, flags: u32) -> s32 #foreign libcurl;

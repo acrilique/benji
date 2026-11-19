@@ -1,5 +1,6 @@
 //
-// Discord's gateway and REST API, on libcurl. Everything here runs on the main thread.
+// Discord's gateway and REST API, on libcurl. Everything here runs on the main thread,
+// except the WebSocket helpers at the end, which the voice thread uses too.
 //
 
 DISCORD_API_URL       :: "https://discord.com/api/v10";
@@ -178,27 +179,13 @@ gateway_connect :: (gw: *Gateway) -> Gateway_Connect_Result, reason: string {
         url = gateway_url(base_url);
     }
 
-    gw.curl = curl_handle_create();
-    if !gw.curl {
-        print("Gateway: curl_easy_init failed\n");
-        return .FAILED, "";
-    }
-    curl_easy_setopt_ptr(gw.curl, CURLOPT_URL, temp_c_string(url));
-    curl_easy_setopt_long(gw.curl, CURLOPT_CONNECT_ONLY, 2);
-    curl_easy_setopt_long(gw.curl, CURLOPT_CONNECTTIMEOUT_MS, 10000);
-    ret := curl_easy_perform(gw.curl);
-    if ret != CURLE_OK {
-        print("Gateway: couldn't connect to %: %\n", url, to_string(curl_easy_strerror(ret)));
-        gateway_disconnect(gw);
-        return .FAILED, "";
-    }
-    curl_easy_getinfo_socket(gw.curl, CURLINFO_ACTIVESOCKET, *gw.socket);
+    gw.curl, gw.socket = websocket_open(url, "Gateway");
+    if !gw.curl  return .FAILED, "";
 
     gw.rx.count = 0;
     gw.ready = false;
     gw.closing = false;
     gw.heartbeat_acknowledged = true;
-    print("Gateway: connected to %\n", url);
     return .CONNECTED, "";
 }
 
@@ -234,34 +221,13 @@ gateway_loop :: (gw: *Gateway) {
 // Handles every message libcurl has. Sets gw.closing when the connection is over.
 gateway_drain :: (gw: *Gateway) {
     while !gw.closing {
-        if gw.rx.allocated - gw.rx.count < 4096  array_reserve(*gw.rx, max(65536, gw.rx.allocated * 2));
-
-        got: u64;
-        meta: *Curl_Ws_Frame;
-        ret := curl_ws_recv(gw.curl, gw.rx.data + gw.rx.count, xx (gw.rx.allocated - gw.rx.count), *got, *meta);
-        if ret == CURLE_AGAIN  return;
-        if ret != CURLE_OK {
-            gateway_on_close(gw, WS_CLOSE_ABNORMAL, to_string(curl_easy_strerror(ret)));
-            return;
-        }
-
-        if meta.flags & (CURLWS_PING | CURLWS_PONG)  continue;  // libcurl answers pings itself
-
-        gw.rx.count += xx got;
-        if meta.bytesleft > 0 || (meta.flags & CURLWS_CONT)  continue;
-
-        msg := string.{gw.rx.count, gw.rx.data};
-        gw.rx.count = 0;
-
-        if meta.flags & CURLWS_CLOSE {
-            code := ifx msg.count >= 2 then cast(s64) get_u16_be(msg.data) else WS_CLOSE_ABNORMAL;
-            reason := ifx msg.count > 2 then slice(msg, 2, msg.count - 2) else "";
-            gateway_on_close(gw, code, reason);
-            return;
-        }
-        if meta.flags & CURLWS_TEXT {
-            reset_temporary_storage();
-            gateway_on_text(gw, msg);
+        event, msg, code := websocket_recv(gw.curl, *gw.rx);
+        if event == {
+            case .NOTHING;  return;
+            case .CLOSED;   gateway_on_close(gw, code, msg);
+            case .TEXT;
+                reset_temporary_storage();
+                gateway_on_text(gw, msg);
         }
     }
 }
@@ -386,8 +352,7 @@ gateway_close :: (gw: *Gateway, code: u16, reason: string) {
     payload := cast(*u8) talloc(2 + reason.count);
     put_u16_be(payload, code);
     memcpy(payload + 2, reason.data, reason.count);
-    sent: u64;
-    curl_ws_send(gw.curl, payload, xx (2 + reason.count), *sent, 0, CURLWS_CLOSE);
+    websocket_send(gw.curl, .{2 + reason.count, payload}, CURLWS_CLOSE);
 
     gw.closing = true;
 }
@@ -395,13 +360,9 @@ gateway_close :: (gw: *Gateway, code: u16, reason: string) {
 gateway_send :: (gw: *Gateway, text: string) -> bool {
     if gw.closing  return false;
 
-    sent: u64;
-    ret := curl_ws_send(gw.curl, text.data, xx text.count, *sent, 0, CURLWS_TEXT);
-    if ret != CURLE_OK || sent != xx text.count {
-        gateway_on_close(gw, WS_CLOSE_ABNORMAL, tprint("send failed: %", to_string(curl_easy_strerror(ret))));
-        return false;
-    }
-    return true;
+    error := websocket_send(gw.curl, cast([]u8) text, CURLWS_TEXT);
+    if error  gateway_on_close(gw, WS_CLOSE_ABNORMAL, tprint("send failed: %", error));
+    return !error;
 }
 
 gateway_send_identify :: (gw: *Gateway) {
@@ -538,4 +499,76 @@ discord_report_if_failed :: (action: string, status: s64, response: string) {
 discord_respond :: (interaction: *Interaction, action: string, body: string) {
     status, response := rest_request("POST", tprint("/interactions/%/%/callback", interaction.id, interaction.token), body);
     discord_report_if_failed(action, status, response);
+}
+
+//
+// WebSocket, for the gateway and the voice connection
+//
+
+Websocket_Event :: enum {
+    NOTHING;  // nothing more to read for now
+    TEXT;
+    BINARY;
+    CLOSED;   // the message is the reason
+}
+
+// Returns null when it couldn't connect, after saying why.
+websocket_open :: (url: string, who: string) -> *CURL, curl_socket_t {
+    curl := curl_handle_create();
+    if !curl {
+        print("%: curl_easy_init failed\n", who);
+        return null, 0;
+    }
+    curl_easy_setopt_ptr(curl, CURLOPT_URL, temp_c_string(url));
+    curl_easy_setopt_long(curl, CURLOPT_CONNECT_ONLY, 2);
+    curl_easy_setopt_long(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000);
+    ret := curl_easy_perform(curl);
+    if ret != CURLE_OK {
+        print("%: couldn't connect to %: %\n", who, url, to_string(curl_easy_strerror(ret)));
+        curl_easy_cleanup(curl);
+        return null, 0;
+    }
+
+    socket: curl_socket_t;
+    curl_easy_getinfo_socket(curl, CURLINFO_ACTIVESOCKET, *socket);
+    print("%: connected to %\n", who, url);
+    return curl, socket;
+}
+
+// Reads the next whole message, which stays in `rx` until the next call. A connection that
+// dropped comes back as CLOSED with WS_CLOSE_ABNORMAL.
+websocket_recv :: (curl: *CURL, rx: *[..]u8) -> Websocket_Event, message: string, close_code: s64 {
+    while true {
+        if rx.allocated - rx.count < 4096  array_reserve(rx, max(65536, rx.allocated * 2));
+
+        got: u64;
+        meta: *Curl_Ws_Frame;
+        ret := curl_ws_recv(curl, rx.data + rx.count, xx (rx.allocated - rx.count), *got, *meta);
+        if ret == CURLE_AGAIN  return .NOTHING, "", 0;
+        if ret != CURLE_OK     return .CLOSED, to_string(curl_easy_strerror(ret)), WS_CLOSE_ABNORMAL;
+        if meta.flags & (CURLWS_PING | CURLWS_PONG)  continue;  // libcurl answers pings itself
+
+        rx.count += xx got;
+        if meta.bytesleft > 0 || (meta.flags & CURLWS_CONT)  continue;
+
+        msg := string.{rx.count, rx.data};
+        rx.count = 0;
+        if meta.flags & CURLWS_CLOSE {
+            code := ifx msg.count >= 2 then cast(s64) get_u16_be(msg.data) else WS_CLOSE_ABNORMAL;
+            reason := ifx msg.count > 2 then slice(msg, 2, msg.count - 2) else "";
+            return .CLOSED, reason, code;
+        }
+        if meta.flags & CURLWS_TEXT    return .TEXT, msg, 0;
+        if meta.flags & CURLWS_BINARY  return .BINARY, msg, 0;
+    }
+    return .NOTHING, "", 0;
+}
+
+// Sends a whole message. Returns what went wrong, or an empty string.
+websocket_send :: (curl: *CURL, data: []u8, flags: u32) -> error: string {
+    sent: u64;
+    ret := curl_ws_send(curl, data.data, xx data.count, *sent, 0, flags);
+    if ret != CURLE_OK        return to_string(curl_easy_strerror(ret));
+    if sent != xx data.count  return tprint("sent % of % bytes", sent, data.count);
+    return "";
 }
