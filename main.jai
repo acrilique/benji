@@ -108,6 +108,7 @@ Player :: struct {
     playing: [..]string;
     current := -1;  // index in `playing`, or -1 when nothing is playing
     stop_requested: bool;
+    skip_requested: bool;
 }
 
 player: Player;
@@ -267,26 +268,18 @@ command_handle :: (interaction: *Interaction) -> string {
         file := string_option(interaction, "file");  // optional: without it, play from the top
 
         channel_id := voice_channel_of(interaction.guild_id, interaction.user_id);
-        if !channel_id  return "Join an audio channel first, or use /join to pick one.";
+        if !channel_id  return "Join an audio channel first.";
 
         return join_and_play(interaction.guild_id, channel_id, file);
     }
 
-    if name == "join" {
-        channel_id, found := channel_option(interaction, "channel");
-        if !found return "Pick an audio channel.";
-        file := string_option(interaction, "file");
-
-        return join_and_play(interaction.guild_id, channel_id, file);
-    }
-
-    if name == "stop" {
+    if name == "skip" {
         if interaction.guild_id != voice.guild_id
             return "Not connected to any channel in this server.";
 
-        stopped := player_stop();
-        if !stopped  return "Nothing is playing.";
-        return tprint("Stopped `%`.", stopped);
+        skipped := player_skip();
+        if !skipped  return "Nothing is playing.";
+        return tprint("Skipped `%`.", skipped);
     }
 
     if name == "leave" {
@@ -402,14 +395,6 @@ string_option :: (interaction: *Interaction, name: string) -> string, found: boo
     return "", false;
 }
 
-channel_option :: (interaction: *Interaction, name: string) -> id: u64, found: bool {
-    value, found := string_option(interaction, name);
-    if !found  return 0, false;
-
-    id, success := string_to_int(value, 10, u64);
-    return id, success;
-}
-
 send_reply :: (interaction: *Interaction, text: string) {
     discord_respond(interaction, "Couldn't reply", tprint("{\"type\":%,\"data\":{\"content\":%,\"flags\":%}}",
         DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE, json_quote(text), DISCORD_MESSAGE_EPHEMERAL));
@@ -469,18 +454,15 @@ json_quote :: (s: string) -> string {
 register_commands :: (application_id: u64) {
     FILE_OPTION :: #run tprint("{\"type\":%,\"name\":\"file\",\"description\":\"File to start from, inside the music folder (default: the first one)\",\"autocomplete\":true}",
         DISCORD_APPLICATION_OPTION_STRING);
-    CHANNEL_OPTION :: #run tprint("{\"type\":%,\"name\":\"channel\",\"description\":\"Audio channel to join\",\"required\":true,\"channel_types\":[%,%]}",
-        DISCORD_APPLICATION_OPTION_CHANNEL, DISCORD_CHANNEL_GUILD_VOICE, DISCORD_CHANNEL_GUILD_STAGE_VOICE);
 
     command :: (name: string, description: string, options: .. string) -> string {
         return tprint("{\"type\":%,\"name\":%,\"description\":%,\"options\":[%],\"default_member_permissions\":\"%\"}",
             DISCORD_APPLICATION_CHAT_INPUT, json_quote(name), json_quote(description), join(.. options, ",",, temp),
             DISCORD_PERMISSION_ADMINISTRATOR);
     }
-    body := tprint("[%,%,%,%]",
+    body := tprint("[%,%,%]",
         command("play",  "Join your audio channel and play the music folder", FILE_OPTION),
-        command("join",  "Join an audio channel and play the music folder", CHANNEL_OPTION, FILE_OPTION),
-        command("stop",  "Stop playing"),
+        command("skip",  "Skip to the next track"),
         command("leave", "Leave the audio channel"));
 
     status, response := rest_request("PUT", tprint("/applications/%/commands", application_id), body);
@@ -519,7 +501,7 @@ stop_voice_ws :: () {
 }
 
 // The voice thread can end on its own: the connection failed, or Discord closed it.
-// When it has, this cleans up after it, so the next /play or /join connects again.
+// When it has, this cleans up after it, so the next /play connects again.
 voice_ws_alive :: () -> bool {
     if voice_ws_running && thread_is_done(*voice_thread)  stop_voice_ws();
     return voice_ws_running;
@@ -1311,6 +1293,7 @@ play_track :: (ws: *Voice_Ws, opus_enc: *void, name: string, next_frame: *Apollo
         reset_temporary_storage();
         if atomic_read(*ws.audio_stop)  return .CUT_OFF;
         if atomic_read(*player.stop_requested)  return .STOPPED;
+        if atomic_read(*player.skip_requested)  return .FINISHED;
 
         frames_read := decoder_read(dec, pcm.data, FRAME_SIZE);
         if frames_read < 0 {
@@ -1420,21 +1403,21 @@ player_play :: (playlist: [..]string) {
     signal(*player.wake);
 }
 
-// Returns the name of the track it stopped, or of the first one waiting to start, in temporary
-// storage. Empty when nothing was playing or waiting.
-player_stop :: () -> string {
+player_stop :: () {
+    lock(*player.mutex);
+    if player.current >= 0  atomic_write(*player.stop_requested, true);
+    free_playlist(*player.pending);
+    unlock(*player.mutex);
+}
+
+// Returns the name of the track it skipped, in temporary storage. Empty when nothing was playing.
+player_skip :: () -> string {
     lock(*player.mutex);
     defer unlock(*player.mutex);
 
-    stopped: string;
-    if player.current >= 0 {
-        atomic_write(*player.stop_requested, true);
-        stopped = copy_temporary_string(player.playing[player.current]);
-    } else if player.pending.count {
-        stopped = copy_temporary_string(player.pending[0]);
-    }
-    free_playlist(*player.pending);
-    return stopped;
+    if player.current < 0  return "";
+    atomic_write(*player.skip_requested, true);
+    return copy_temporary_string(player.playing[player.current]);
 }
 
 player_take_pending :: () -> []string, found: bool {
@@ -1452,6 +1435,7 @@ player_take_pending :: () -> []string, found: bool {
 player_set_current :: (index: s64) {
     lock(*player.mutex);
     player.current = index;
+    atomic_write(*player.skip_requested, false);
     unlock(*player.mutex);
 }
 
@@ -1459,6 +1443,7 @@ player_finish :: () {
     lock(*player.mutex);
     free_playlist(*player.playing);
     player.current = -1;
+    atomic_write(*player.skip_requested, false);
     unlock(*player.mutex);
 }
 
